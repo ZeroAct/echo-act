@@ -507,7 +507,7 @@ The desktop client is PySide6, Qt 6 Widgets, in the application process. Each la
 | Layer | Choice | Requirement it answers |
 | --- | --- | --- |
 | Toolkit | PySide6 under LGPLv3. PyQt6 is avoided because it is GPL. | N-11, and N-30, where Qt Widgets has stronger desktop accessibility than the alternatives |
-| Reading surface | `QPlainTextEdit` with one view-level extra selection for the current segment | F-29, because an extra selection never enters the document, so copying and storage stay plain; F-30, because it never moves the text cursor; and a constant-cost highlight update at 50,000 characters |
+| Reading surface | `QTextEdit` with one view-level extra selection for the current segment | F-29, because an extra selection never enters the document, so copying and storage stay plain; F-30, because it never moves the text cursor; N-13, measured in `spikes/outline_emphasis.py`; and a constant-cost highlight update at 50,000 characters |
 | Audio | PortAudio through a callback ring buffer, not the toolkit's media layer | N-12, which needs a sample-accurate frame counter, and F-67, which needs device enumeration and loss detection |
 | Local service | FastAPI and uvicorn in a worker thread of the same process | F-79, since the GUI must survive a failed bind and therefore cannot reach the engine over the network path |
 | Database | SQLite in write-ahead mode with a bounded busy timeout | N-10, no server to install, and N-14, which forbids waiting indefinitely on a lock |
@@ -516,7 +516,7 @@ The desktop client is PySide6, Qt 6 Widgets, in the application process. Each la
 
 Three details follow from the requirements and are easy to get wrong:
 
-- Emphasis is drawn as a glyph outline rather than a heavier weight. Layout uses the font's advance widths, which an outline does not change, so the text does not reflow and N-13 holds. This assumption is in A.4.
+- Emphasis is drawn as a glyph outline, and it has to be. An extra selection is a paint-time format, so a weight change applied through one is discarded silently: `spikes/outline_emphasis.py` measures zero changed pixels for bold at every scale factor, on both candidate widgets. An outline is a painting attribute, so it renders, and since nothing in the mechanism can re-shape glyphs, the layout stability N-13 needs comes from the mechanism rather than from the choice of format. The same spike confirms the naive alternative fails: bold merged into the document does reflow, shifting every line below the emphasised one. A pen width of 0.3 to 0.4 reads as emphasis with under one percent of the ink falling outside the emphasised characters' own cells.
 - The highlight is driven from the audio callback's frame counter mapped through the segment time table, never from a timer polling a player's reported position. Only the former can hold the 300 ms in N-12, and it is also what yields the separate device-latency figure N-12 asks for.
 - The inference runtime is pinned to its CPU provider, with accelerator providers not bundled at all, and its thread count is capped. N-05 forbids automatically occupying the GPU, and the thread cap is half of F-20 with the operating-system resource control being the other half.
 
@@ -540,5 +540,5 @@ External facts these requirements depend on that have not been confirmed yet.
 - Supertonic 3 and Qwen3-TTS 0.6B and 1.7B CustomVoice: weights actually obtainable, a CPU-only inference path, native sample rates, and genuine Korean coverage. F-04, F-06, and F-82 all depend on these.
 - Redistribution rights for the 19 voices in F-06. The CustomVoice naming implies reference-audio conditioning while Section 7 excludes voice cloning, which means fixed reference voices ship inside the product and must be licensed for that use. This gates N-11, F-63, and F-84.
 - The MCP protocol revision cited in Section 2.11, and confirmation that its resource mechanism covers the delivery path F-60 now specifies.
-- That Qt honors a text-outline character format inside a `QPlainTextEdit` extra selection without changing layout. A.2 depends on this for N-13, and it is a twenty-line spike. If it does not hold, the fallback is a bundled family whose bold face is metric-compatible with its regular face.
+- Whether `QPlainTextEdit` can replace `QTextEdit` as the reading surface. It is the cheaper widget for a 50,000-character document and its pixel behaviour is identical, but `spikes/outline_emphasis.py` cannot prove its layout stability: its `cursorRect` sweep is not idempotent, and its document-level control does not reflow far enough to measure an outline against. Worth resolving if the heavier widget proves slow, and not before.
 - Windows code signing, and Apple Developer signing and notarization, for N-29. Procurement lead time, needed well before release.
