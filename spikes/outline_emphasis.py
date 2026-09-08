@@ -192,8 +192,7 @@ def child(scale: str) -> int:
 
         for label, fmt in cases:
             select(w, fmt)
-            g, px = geometry(w), pixels(w)
-            moved = sum(1 for a, b in zip(base_geom, g) if a != b)
+            px = pixels(w)
             diff = np.any(px != base_px, axis=2)
             spill = int((diff & ~mask).sum())
             low = lowest_change(px)
