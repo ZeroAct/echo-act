@@ -93,7 +93,7 @@ All features follow the same input validation, job states, permission, and resou
 | F-26 | Bold the current segment | The segment of source text actually being played is shown in bold. Segments are not highlighted merely because they have been generated but not yet played. The default precision is segment level; word-level synchronization is not required. The emphasis is rendered by a metric-stable mechanism so that it does not change text layout, per N-13. |
 | F-27 | Linking source text to audio | For each segment, the position in that job's source text is linked to the audio start and end times. The correct position is highlighted even when the same sentence repeats, and for input containing Hangul, Latin text, symbols, line breaks, and emoji, no characters may be dropped or linked to the wrong position. Text normalization performed before synthesis, such as number, date, currency, and abbreviation expansion, must carry an alignment back to the original text, so that every segment range refers to what the user entered and never to normalized text. Source spans that produce no audio, such as whitespace runs, emoji, and decorative symbols, are attached to an adjacent segment rather than dropped, and inter-segment silence introduced by F-08 is attributed to the segment that precedes it. |
 | F-28 | Highlighting by state | During playback the current segment is highlighted; during pauses between segments the previous segment's highlight is retained. While paused or waiting on the buffer, the last position is retained but the state is indicated separately. On stop, cancel, or natural end, highlighting is cleared. On seek, highlighting is updated to the new position. |
-| F-29 | Source text preservation | Bold is for on-screen display only and does not insert asterisks or formatting characters into the source text. Highlight formatting does not leak into copying, database storage, or regeneration. The source text used for generation is fixed per job, and changing the input does not link previous audio to different source text. |
+| F-29 | Source text preservation | Bold is for on-screen display only and does not insert asterisks or formatting characters into the source text. Highlight formatting does not leak into copying, database storage, or regeneration. The source text used for generation is fixed per job, and changing the input does not link previous audio to different source text. Because the highlight refers to that frozen snapshot while the input surface stays editable, the two are compared continuously: while the input matches the snapshot the highlight tracks playback, and on any divergence the highlight is cleared and reported as unavailable rather than re-anchored to edited text, as in F-31. If the input matches the snapshot again the highlight resumes, so availability is a function of the current text alone and carries no hidden state. Playback is unaffected either way, because the audio still corresponds to the snapshot. |
 | F-30 | Follow the reading position | Auto-scroll that keeps the current segment on screen can be turned on and off. The default is on. If the user scrolls manually, following is paused and resumes via a return-to-current-position action. Highlight changes must not steal the caret, the selection, or keyboard focus. |
 | F-31 | Highlighting on history playback | If saved audio along with source text and segment information exists, reopening it highlights identically. If existing history or restored data has no mapping information, playback is allowed but it is indicated that highlighting is unavailable. Precise reading positions are not estimated arbitrarily. Importing external audio files is not included. |
 
@@ -342,6 +342,7 @@ Even if a result has already expired and no longer exists, calling again with a 
 - GUI generation auto-plays when the first segment is ready unless auto-play is turned off per F-83. API and MCP generation never auto-play.
 - Stopping or pausing playback does not change the generation state. Canceling generation also stops playback of that job.
 - When input is replaced or a different history item is opened, existing playback is stopped and switched to the correct job so that existing audio is never played over different source text.
+- Editing the input without replacing it does not stop playback. Once the input no longer matches the job's snapshot the highlight is dropped and reported as unavailable, per F-29, and it returns only if the text matches the snapshot again.
 
 ### 5.3 Key Exceptions
 
@@ -368,7 +369,7 @@ The scenarios below are mandatory acceptance items required for release approval
 | A-01 | F-01–F-09, F-32–F-37 | Verify empty input, 50,000 and 50,001 characters, file size boundaries, and UTF-8, CP949, and corrupted encodings. On failure or cancellation, the existing input must be unchanged. |
 | A-02 | F-26–F-29, F-81, N-12, N-13 | For Korean, English, and mixed sentences, repeated sentences, emoji, and long-sentence splitting, the played segment and the bold highlight must match, and the source text and copied output must be unchanged. Text containing numbers, dates, currency, and abbreviations must highlight the original characters rather than their expanded reading, and emphasis transitions must not shift layout. |
 | A-03 | F-12–F-15, F-28–F-30 | With generation slower than playback, and across pause, seek forward and back, stop, cancel, and play-to-end, states and highlighting must transition as defined. |
-| A-04 | F-29–F-31, N-13 | Focus must not be stolen during manual scrolling or selection, and on source-text changes or history switching, audio must not be linked to a different job. |
+| A-04 | F-29–F-31, N-13 | Focus must not be stolen during manual scrolling or selection, and on source-text changes or history switching, audio must not be linked to a different job. Editing the input during playback must clear the highlight and report it as unavailable rather than shifting it onto the wrong characters, and restoring the text must bring it back. |
 | A-05 | F-32–F-37 | Safely reject PDF, DOCX, HWP, image, and executable files as well as samples with disguised extensions. There must be no external transmission, file execution, or replacement of the source text. |
 | A-06 | F-24, F-38–F-42 | After saving and restarting, documents and history can be searched, voice settings are restored, and playback with highlighting works. Document edits and regeneration must not alter previous jobs. |
 | A-07 | F-42–F-45, N-14–N-16 | Across one-off expiry, retention limits, deletion failure, missing files, corrupted backups, and errors during restore, there must be no loss of explicitly retained data and no false completion. |
@@ -495,6 +496,32 @@ Non-normative. The body of this document stays technology-independent; this reco
 - Synthesis runs in a child process governed by an operating-system resource-control facility. On Windows that is what makes the enforced CPU and memory limits in N-03 achievable, and it is also what lets N-21 measure the generation job separately from total app usage. Releasing resources within the five seconds N-22 allows implies aborting mid-segment, which in practice means the worker can be terminated at any instant without corrupting the database or a retained result.
 - The GUI must stay usable when the REST port cannot be bound, per F-79, so it must not depend on reaching the service over the network path.
 
+Process layout:
+
+- One application process holding the GUI, the job engine, the database, the local REST service, and audio playback.
+- One synthesis worker process at a time, inside an operating-system resource-control container, per F-47, N-03, and N-21.
+- One transient MCP server process per client, started by that client and reaching the application over loopback, per F-58.
+
+The desktop client is PySide6, Qt 6 Widgets, in the application process. Each layer below was chosen against a requirement rather than by preference.
+
+| Layer | Choice | Requirement it answers |
+| --- | --- | --- |
+| Toolkit | PySide6 under LGPLv3. PyQt6 is avoided because it is GPL. | N-11, and N-30, where Qt Widgets has stronger desktop accessibility than the alternatives |
+| Reading surface | `QPlainTextEdit` with one view-level extra selection for the current segment | F-29, because an extra selection never enters the document, so copying and storage stay plain; F-30, because it never moves the text cursor; and a constant-cost highlight update at 50,000 characters |
+| Audio | PortAudio through a callback ring buffer, not the toolkit's media layer | N-12, which needs a sample-accurate frame counter, and F-67, which needs device enumeration and loss detection |
+| Local service | FastAPI and uvicorn in a worker thread of the same process | F-79, since the GUI must survive a failed bind and therefore cannot reach the engine over the network path |
+| Database | SQLite in write-ahead mode with a bounded busy timeout | N-10, no server to install, and N-14, which forbids waiting indefinitely on a lock |
+| Packaging | A PyInstaller directory bundle, then signing and notarization | N-10 describes a folder of an executable and companion files, and that layout is also what keeps Qt as separate shared libraries for LGPL relinking. A single-file bundle satisfies neither. |
+| Typeface | One bundled open-licensed Korean and Latin family rather than the per-OS defaults | N-12 and N-30, so metrics and therefore measurements are identical on both operating systems |
+
+Three details follow from the requirements and are easy to get wrong:
+
+- Emphasis is drawn as a glyph outline rather than a heavier weight. Layout uses the font's advance widths, which an outline does not change, so the text does not reflow and N-13 holds. This assumption is in A.4.
+- The highlight is driven from the audio callback's frame counter mapped through the segment time table, never from a timer polling a player's reported position. Only the former can hold the 300 ms in N-12, and it is also what yields the separate device-latency figure N-12 asks for.
+- The inference runtime is pinned to its CPU provider, with accelerator providers not bundled at all, and its thread count is capped. N-05 forbids automatically occupying the GPU, and the thread cap is half of F-20 with the operating-system resource control being the other half.
+
+Alternatives were rejected on requirements rather than taste. A web-view shell cannot select an audio output device on macOS, which breaks F-67. A bundled-browser shell has the wrong memory baseline for the 8 GiB floor in Section 8.1 against the 2 GiB generation budget in F-23. A browser-served UI is ruled out by F-46 and F-79 together, since the owner can turn the service off and the GUI must still work.
+
 ### A.3 Open Decisions
 
 Product judgments deliberately left open. Each is a live tension in the current requirements rather than an oversight.
@@ -513,4 +540,5 @@ External facts these requirements depend on that have not been confirmed yet.
 - Supertonic 3 and Qwen3-TTS 0.6B and 1.7B CustomVoice: weights actually obtainable, a CPU-only inference path, native sample rates, and genuine Korean coverage. F-04, F-06, and F-82 all depend on these.
 - Redistribution rights for the 19 voices in F-06. The CustomVoice naming implies reference-audio conditioning while Section 7 excludes voice cloning, which means fixed reference voices ship inside the product and must be licensed for that use. This gates N-11, F-63, and F-84.
 - The MCP protocol revision cited in Section 2.11, and confirmation that its resource mechanism covers the delivery path F-60 now specifies.
+- That Qt honors a text-outline character format inside a `QPlainTextEdit` extra selection without changing layout. A.2 depends on this for N-13, and it is a twenty-line spike. If it does not hold, the fallback is a bundled family whose bold face is metric-compatible with its regular face.
 - Windows code signing, and Apple Developer signing and notarization, for N-29. Procurement lead time, needed well before release.
