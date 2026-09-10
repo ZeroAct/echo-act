@@ -53,7 +53,7 @@ from ..domain import (
 from ..engine.supervisor import WorkerSupervisor
 from ..errors import Code, EchoActError
 from ..models.manifest import Manifest
-from ..models.registry import ModelRegistry
+from ..models.registry import ModelRegistry, ModelState
 from ..paths import audio_dir, temp_dir
 from ..policy import (
     BOUNDED_WAIT_CEILING_S,
@@ -224,6 +224,7 @@ class JobEngine:
         if not runnable:
             # F-04: unavailable with the reason, never silently substituted.
             raise EchoActError(Code.MODEL_OVER_BUDGET, why or None)
+        self._check_model_preparable(request.settings.model_id)
 
         with self._lock:
             if self._closing:
@@ -296,6 +297,31 @@ class JobEngine:
         except BaseException:
             self._release_slot()
             raise
+
+    def _check_model_preparable(self, model_id: str) -> None:
+        """Refuse at acceptance what could only fail later anyway.
+
+        5.3 says a request for a model that is not downloaded is *refused*,
+        not accepted and then failed, and the same reasoning covers a
+        licence nobody has accepted: both are knowable now, neither can
+        change while the job waits, and accepting the job would consume
+        F-49's key on something that can never run and hand the caller a
+        job id to poll instead of an answer.
+
+        Deliberately the shallow check.  N-22 gives acceptance one second
+        at p95 and a deep verify hashes 385 MB; the deep pass still runs in
+        ``_prepare``, where its cost belongs.
+        """
+        status = self._registry.status(model_id, deep=False)
+        if status.state is ModelState.CORRUPT:
+            raise EchoActError(Code.MODEL_CORRUPT, detail={"model_id": model_id})
+        if status.state is not ModelState.READY:
+            raise EchoActError(Code.MODEL_NOT_READY, detail={"model_id": model_id})
+        if status.license_acceptance_required and not status.license_accepted:
+            raise EchoActError(
+                Code.MODEL_LICENSE_NOT_ACCEPTED,
+                detail={"model_id": model_id, "license": status.license_name},
+            )
 
     def _release_slot(self) -> None:
         with self._lock:
