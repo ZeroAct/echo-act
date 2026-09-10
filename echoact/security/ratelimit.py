@@ -49,7 +49,9 @@ from ..util.ids import monotonic
 #: spend two full allowances back to back across the boundary.
 WINDOW_S: Final = 60.0
 
-#: How many distinct keys each table will hold.  4.1 fixes no figure, because
+#: How many distinct keys each limiter will track -- for authentication that
+#: is origins, counted once each whether the origin is accumulating failures
+#: or serving a lockout.  4.1 fixes no figure, because
 #: on a loopback-only service the real bound is the number of issued
 #: credentials; this is the backstop that keeps the table finite anyway.  Both
 #: are far above any plausible legitimate count -- 4.1 allows one credential
@@ -154,9 +156,6 @@ class _Window:
 
     def add(self, now: float) -> None:
         self._hits.append(now)
-
-    def clear(self) -> None:
-        self._hits.clear()
 
     def retry_after(self, now: float) -> float:
         """When the oldest counted event leaves the window.
@@ -338,10 +337,15 @@ class AuthFailureLimiter:
     @property
     def tracked_origins(self) -> int:
         with self._lock:
-            return len(set(self._failures) | set(self._locked_until))
+            return self._tracked_locked()
 
     def sweep(self) -> int:
-        """Drop origins with no live failures and no live lockout."""
+        """Drop origins with no live failures and no live lockout.
+
+        The count is what ``tracked_origins`` drops by, which is only true
+        because the two tables are disjoint: a locked origin is counted once,
+        under its lockout, and reclaiming it means the lockout has lapsed.
+        """
         now = self._clock()
         with self._lock:
             stale = [o for o, w in self._failures.items() if _window_expired(w, now)]
@@ -350,8 +354,7 @@ class AuthFailureLimiter:
             lapsed = [o for o, until in self._locked_until.items() if until <= now]
             for origin in lapsed:
                 del self._locked_until[origin]
-                self._failures.pop(origin, None)
-            return len(set(stale) | set(lapsed))
+            return len(stale) + len(lapsed)
 
     def check(self, origin: str) -> Lockout:
         """Ask whether this origin may attempt authentication at all.
@@ -396,8 +399,12 @@ class AuthFailureLimiter:
                 self._failures[origin] = window
             window.add(now)
             if len(window) >= AUTH_FAILURES_PER_MIN:
+                # The lockout replaces the window rather than sitting beside
+                # an emptied one: the lockout entry is now what tracks this
+                # origin, and leaving a spent window behind made the origin
+                # count twice in ``sweep`` and zero times against the cap.
                 self._locked_until[origin] = now + AUTH_LOCKOUT_S
-                window.clear()
+                del self._failures[origin]
                 return Lockout(
                     locked=True,
                     failures=AUTH_FAILURES_PER_MIN,
@@ -458,20 +465,49 @@ class AuthFailureLimiter:
             locked=False, failures=len(window), limit=AUTH_FAILURES_PER_MIN, retry_after_s=0.0
         )
 
+    def _tracked_locked(self) -> int:
+        """How many origins the two tables hold between them.
+
+        They are disjoint by construction -- an origin is either accumulating
+        failures or locked out, and locking moves it from one to the other --
+        so this is a sum, not a union.  Were that ever to stop being true the
+        sum would over-count, which refuses an untracked attempt sooner: the
+        safe direction for a cap whose job is to stay finite.
+        """
+        return len(self._failures) + len(self._locked_until)
+
     def _prune_locked(self, now: float) -> bool:
-        if len(self._failures) < self._max_origins:
+        """Drop lapsed origins.  True if the tables are still full.
+
+        MAX_TRACKED_ORIGINS covers lockouts too.  A cap on ``_failures``
+        alone bounds nothing: ten failures move an origin into
+        ``_locked_until`` and out of the table being measured, so an inventor
+        of origins buys one permanent entry per ten attempts -- exactly the
+        traffic the limit exists to answer.
+        """
+        if self._tracked_locked() < self._max_origins:
             return False
         for origin in [o for o, w in self._failures.items() if _window_expired(w, now)]:
             del self._failures[origin]
         for origin in [o for o, until in self._locked_until.items() if until <= now]:
             del self._locked_until[origin]
-            self._failures.pop(origin, None)
-        return len(self._failures) >= self._max_origins
+        return self._tracked_locked() >= self._max_origins
 
     def _soonest_free_locked(self, now: float) -> float:
-        soonest = WINDOW_S
+        """When a slot next frees up, for the refusal's retry hint.
+
+        Lockouts are counted here for the same reason they are counted
+        against the cap: once an origin locks it has no failure window left,
+        so a table full of lockouts would answer with the bare WINDOW_S
+        default -- a made-up constant, which is what F-57's hint must not be.
+        """
+        soonest = max(WINDOW_S, AUTH_LOCKOUT_S)
         for window in self._failures.values():
             after = window.retry_after(now)
+            if 0.0 < after < soonest:
+                soonest = after
+        for until in self._locked_until.values():
+            after = until - now
             if 0.0 < after < soonest:
                 soonest = after
         return soonest

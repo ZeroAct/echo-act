@@ -12,7 +12,11 @@ on disk.
 
 from __future__ import annotations
 
+import errno
 import io
+import json
+import logging
+import os
 import wave
 from pathlib import Path
 from typing import Any
@@ -22,8 +26,9 @@ import pytest
 import supertonic
 
 from echoact import paths
+from echoact.audio import wav
 from echoact.engine import protocol as proto
-from echoact.engine import worker
+from echoact.engine import runtime, worker
 from echoact.errors import Code
 from echoact.policy import ENGINE_MAX_CHUNK_CODEPOINTS, ENGINE_SILENCE_DURATION_S
 
@@ -54,6 +59,45 @@ class FakeSession:
         return list(self._providers)
 
 
+def engine_constant_providers() -> tuple[str, ...]:
+    """What today's engine registers when nobody pins it.
+
+    ``supertonic.loader.load_onnx_modules`` reads ``DEFAULT_ONNX_PROVIDERS``
+    at call time and hands it to all four ``InferenceSession``s; ``TTS``
+    takes no provider argument, so this constant is the only thing standing
+    between F-87's allow-list and the sessions.
+    """
+    return tuple(supertonic.loader.DEFAULT_ONNX_PROVIDERS)
+
+
+def engine_env_providers() -> tuple[str, ...]:
+    """What an engine build that implements its own TODO would register.
+
+    ``supertonic/config.py`` carries ``# TODO: Add parsing of
+    SUPERTONIC_ONNX_PROVIDERS environment variable`` immediately above the
+    constant, and Supervisor copies the parent's whole environment into this
+    process, so the variable is a provider decision waiting to happen.
+    """
+    raw = os.environ.get("SUPERTONIC_ONNX_PROVIDERS")
+    if raw:
+        return tuple(p.strip() for p in raw.split(",") if p.strip())
+    return engine_constant_providers()
+
+
+#: ``spec["providers"]`` may be an explicit tuple, or one of these, meaning
+#: "let the engine decide the way that build decides".
+PROVIDERS_FROM_CONSTANT = "engine-constant"
+PROVIDERS_FROM_ENV = "engine-env"
+
+
+def resolve_fake_providers(spec_value: Any) -> tuple[str, ...]:
+    if spec_value == PROVIDERS_FROM_CONSTANT:
+        return engine_constant_providers()
+    if spec_value == PROVIDERS_FROM_ENV:
+        return engine_env_providers()
+    return tuple(spec_value)
+
+
 class FakeModel:
     def __init__(self, sample_rate: int, providers: tuple[str, ...], omit: tuple[str, ...]) -> None:
         self.sample_rate = sample_rate
@@ -77,7 +121,11 @@ class FakeTTS:
         self._spec = spec
         self.sample_rate = spec["sample_rate"]
         self.voice_style_names = list(spec["voices"])
-        self.model = FakeModel(spec["sample_rate"], spec["providers"], spec["omit_sessions"])
+        self.model = FakeModel(
+            spec["sample_rate"],
+            resolve_fake_providers(spec["providers"]),
+            spec["omit_sessions"],
+        )
 
     def get_voice_style(self, voice_name: str) -> Any:
         self._rec.style_requests.append(voice_name)
@@ -92,10 +140,14 @@ class FakeTTS:
             failure = errors.pop(0)
             if failure is not None:
                 raise failure
-        n = self._spec["frames"]
-        count = int(n(text) if callable(n) else n)
-        wav = np.full((1, count), self._spec["amplitude"], dtype=np.float32)
-        return wav, np.array([count / self.sample_rate], dtype=np.float32)
+        given = self._spec["waveform"]
+        if given is not None:
+            out = np.asarray(given, dtype=np.float32).reshape(1, -1)
+        else:
+            n = self._spec["frames"]
+            count = int(n(text) if callable(n) else n)
+            out = np.full((1, count), self._spec["amplitude"], dtype=np.float32)
+        return out, np.array([out.size / self.sample_rate], dtype=np.float32)
 
 
 @pytest.fixture
@@ -109,6 +161,7 @@ def engine(monkeypatch) -> Recorder:
         "omit_sessions": (),
         "frames": 4410,
         "amplitude": 0.5,
+        "waveform": None,
         "synth_errors": [],
         "load_error": None,
     }
@@ -129,12 +182,22 @@ def engine(monkeypatch) -> Recorder:
 # ----------------------------------------------------------------------
 
 
-def drive(*requests: Any) -> list[Any]:
-    """Feed requests through one worker run and decode what it wrote."""
+def drive_raw(*requests: Any) -> str:
+    """Feed requests through one worker run and return the bytes it wrote.
+
+    Undecoded, because some claims are about the wire itself: ``NaN`` is not
+    JSON (RFC 8259) and ``json.loads`` accepts it anyway, so a round trip
+    through ``proto.decode`` would hide exactly the defect worth catching.
+    """
     lines = "".join(r if isinstance(r, str) else proto.encode(r) for r in requests)
     out = io.StringIO()
     assert worker.serve(io.StringIO(lines), out) == 0
-    return [proto.decode(line) for line in out.getvalue().splitlines() if line.strip()]
+    return out.getvalue()
+
+
+def drive(*requests: Any) -> list[Any]:
+    """Feed requests through one worker run and decode what it wrote."""
+    return [proto.decode(line) for line in drive_raw(*requests).splitlines() if line.strip()]
 
 
 def load_request(seq: int = 1, **kw: Any) -> proto.Load:
@@ -268,6 +331,96 @@ def test_a_session_running_on_a_remote_provider_is_a_fatal_refusal(engine, tmp_p
 
 def test_a_parent_asking_for_more_than_local_cpu_is_refused_before_any_load(engine):
     replies = drive(load_request(allowed_providers=["CUDAExecutionProvider"]))
+    error = only(replies, proto.Error)
+    assert error.code == Code.RUNTIME_PROVIDER_REFUSED.value
+    assert error.fatal is True
+    assert engine.init_kwargs == {}
+
+
+def test_the_allow_list_is_pinned_onto_session_construction_not_only_audited(engine, monkeypatch):
+    # F-87: the runtime is "restricted to local CPU execution by an explicit
+    # allow-list of execution providers, never by relying on a default".
+    # ``supertonic.TTS`` takes no provider argument and its loader reads
+    # DEFAULT_ONNX_PROVIDERS at call time, so the allow-list has to be
+    # written onto that constant before the sessions are built.  Auditing
+    # afterwards would refuse a load that a pinned session completes
+    # locally, leaving the app unable to generate at all.
+    monkeypatch.setattr(
+        supertonic.loader,
+        "DEFAULT_ONNX_PROVIDERS",
+        ["AzureExecutionProvider", "CPUExecutionProvider"],
+    )
+    engine.spec["providers"] = PROVIDERS_FROM_CONSTANT
+    loaded = only(drive(load_request()), proto.Loaded)
+    assert loaded.providers == ["CPUExecutionProvider"]
+    # The pin is ours for the length of the load and nobody else's after it.
+    assert supertonic.loader.DEFAULT_ONNX_PROVIDERS == [
+        "AzureExecutionProvider",
+        "CPUExecutionProvider",
+    ]
+
+
+def test_a_provider_named_in_the_environment_does_not_get_to_choose(engine, monkeypatch):
+    # Supervisor._child_env copies the parent's whole environment into this
+    # process, and supertonic/config.py has a standing TODO to parse
+    # SUPERTONIC_ONNX_PROVIDERS.  A build that implements it must find our
+    # allow-list there, not whatever the user's shell happened to export.
+    monkeypatch.setenv("SUPERTONIC_ONNX_PROVIDERS", "AzureExecutionProvider,CPUExecutionProvider")
+    engine.spec["providers"] = PROVIDERS_FROM_ENV
+    loaded = only(drive(load_request()), proto.Loaded)
+    assert loaded.providers == ["CPUExecutionProvider"]
+    assert os.environ["SUPERTONIC_ONNX_PROVIDERS"] == "AzureExecutionProvider,CPUExecutionProvider"
+
+
+def test_the_engine_is_handed_the_allow_list_before_it_builds_anything(engine, monkeypatch):
+    factory = supertonic.TTS
+    seen: dict[str, Any] = {}
+
+    def watching_factory(**kwargs: Any) -> Any:
+        seen["constant"] = list(supertonic.loader.DEFAULT_ONNX_PROVIDERS)
+        seen["env"] = os.environ.get("SUPERTONIC_ONNX_PROVIDERS")
+        return factory(**kwargs)
+
+    monkeypatch.setattr(supertonic, "TTS", watching_factory)
+    only(drive(load_request()), proto.Loaded)
+    assert seen["constant"] == ["CPUExecutionProvider"]
+    assert seen["env"] == "CPUExecutionProvider"
+
+
+def test_an_engine_offering_nothing_to_pin_is_still_verified_after_construction(
+    engine, monkeypatch
+):
+    # Pinning is what we asked for and get_providers() is what we got; F-87
+    # needs both.  An engine that has renamed its knob loses the first half
+    # and must not lose the second.
+    monkeypatch.delattr(supertonic.loader, "DEFAULT_ONNX_PROVIDERS")
+    monkeypatch.delattr(supertonic.config, "DEFAULT_ONNX_PROVIDERS")
+    engine.spec["providers"] = ("AzureExecutionProvider", "CPUExecutionProvider")
+    error = only(drive(load_request()), proto.Error)
+    assert error.code == Code.RUNTIME_PROVIDER_REFUSED.value
+    assert error.fatal is True
+
+
+def test_a_parent_that_narrows_the_allow_list_is_held_to_what_it_asked_for(engine, monkeypatch):
+    # The product's list is a ceiling, not a floor.  A parent asking for a
+    # subset gets that subset pinned onto construction and checked against
+    # afterwards; anything else makes the field on the wire decorative.
+    monkeypatch.setattr(
+        runtime, "ALLOWED_PROVIDERS", ("CPUExecutionProvider", "AzureExecutionProvider")
+    )
+    engine.spec["providers"] = ("AzureExecutionProvider",)
+    replies = drive(load_request(allowed_providers=["CPUExecutionProvider"]))
+    error = only(replies, proto.Error)
+    assert error.code == Code.RUNTIME_PROVIDER_REFUSED.value
+    assert error.fatal is True
+    assert engine.init_kwargs["model"] == "supertonic-3"  # it did reach construction
+
+
+def test_a_parent_that_permits_no_provider_at_all_is_refused_not_ignored(engine):
+    # Load.allowed_providers is F-87's allow-list on the wire.  A request
+    # that names nothing usable is a refusal: silently falling back to the
+    # product's full list would make the field decorative.
+    replies = drive(load_request(allowed_providers=[]))
     error = only(replies, proto.Error)
     assert error.code == Code.RUNTIME_PROVIDER_REFUSED.value
     assert error.fatal is True
@@ -422,12 +575,118 @@ def test_running_out_of_memory_mid_segment_is_fatal(engine, tmp_path):
     assert error.fatal is True
 
 
-def test_a_segment_that_cannot_be_written_names_no_directory_in_its_message(engine, tmp_path):
-    missing = tmp_path / "gone" / "a.wav"
-    error = only(drive(load_request(), synth_request(missing)), proto.Error)
-    assert error.code == Code.GENERATION_FAILED.value
+def test_a_write_that_dies_half_way_leaves_no_file_at_the_parents_path(
+    engine, tmp_path, monkeypatch
+):
+    # A truncated segment sitting at the canonical path is indistinguishable
+    # from a finished one to anything that enumerates the directory: F-16's
+    # partial export, N-02's relaunch cleanup, a retry that reads before it
+    # writes.  F-82's writer publishes by rename precisely so that the file
+    # appears only once it is complete.
+    job = tmp_path / "job_abc"
+    job.mkdir()
+    out = job / "seg0.wav"
+    real = wave.Wave_write.writeframesraw
+
+    def full_disk(self: Any, data: Any) -> None:
+        real(self, bytes(data)[: len(bytes(data)) // 2])
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(wave.Wave_write, "writeframesraw", full_disk)
+    error = only(drive(load_request(), synth_request(out)), proto.Error)
+    assert error.code == Code.STORAGE_FULL.value
     assert error.fatal is False
-    assert str(tmp_path) not in error.message
+    assert str(tmp_path) not in error.message  # N-20: no path in a message
+    assert list(job.iterdir()) == []  # neither a short segment nor a scrap
+
+
+def test_the_directory_the_parent_named_is_created_rather_than_failing_the_segment(
+    engine, tmp_path
+):
+    out = tmp_path / "jobs" / "job_abc" / "seg0.wav"
+    audio = only(drive(load_request(), synth_request(out)), proto.Audio)
+    assert Path(audio.out_path) == out
+    assert out.exists()
+
+
+def test_a_segment_is_byte_identical_to_the_module_that_owns_f82(tmp_path):
+    # CLAUDE.md gives audio/ F-82's WAV, and 4.2 stores a digest of the
+    # result, so a second writer in the engine is a second definition of the
+    # format.  Negative overshoot is where the two used to part: clip in
+    # float then scale bottoms out at -32767, scale then clip at -32768.
+    samples = np.array([-1.5, -1.0, 0.0, 0.25, 1.5], dtype=np.float32)
+    mine = tmp_path / "worker.wav"
+    theirs = tmp_path / "audio.wav"
+    report = worker.write_segment_wav(mine, samples, 44100)
+    wav.write_segment(theirs, samples, 44100)
+    assert mine.read_bytes() == theirs.read_bytes()
+    assert np.frombuffer(mine.read_bytes()[44:], dtype="<i2").tolist() == [
+        -32768,
+        -32767,
+        0,
+        8192,
+        32767,
+    ]
+    assert report.frame_count == 5
+    assert report.peak == pytest.approx(1.5)
+    assert report.clipped == 2
+
+
+def test_clipped_samples_are_counted_rather_than_silently_flattened(engine, tmp_path, caplog):
+    # F-55/8.3: flattening a signal without saying so is release-blocking.
+    engine.spec["amplitude"] = 1.5
+    engine.spec["frames"] = 100
+    with caplog.at_level(logging.WARNING, logger="echoact.engine.worker"):
+        audio = only(drive(load_request(), synth_request(tmp_path / "seg0.wav")), proto.Audio)
+    assert audio.peak == pytest.approx(1.5)
+    clipped = [r for r in caplog.records if "clipped" in r.getMessage()]
+    assert len(clipped) == 1
+    assert "samples=100" in clipped[0].getMessage()
+
+
+@pytest.mark.parametrize(
+    "waveform",
+    [
+        [0.5, float("nan"), float("inf"), -0.5],
+        [float("inf")] * 4,
+        [0.0, float("-inf")],
+    ],
+)
+def test_non_finite_engine_output_is_refused_rather_than_written_as_noise(
+    engine, tmp_path, waveform
+):
+    # NaN survives clip and round and casts to an undefined int16; +inf
+    # becomes full scale.  Written, the segment reads back as a valid file
+    # of the right length, so nothing downstream can tell.  audio/wav.py
+    # refuses this input, and the worker must not have a second opinion.
+    engine.spec["waveform"] = waveform
+    out = tmp_path / "seg0.wav"
+    raw = drive_raw(load_request(), synth_request(out))
+    replies = [proto.decode(line) for line in raw.splitlines() if line.strip()]
+    error = only(replies, proto.Error)
+    assert error.code == Code.INTERNAL.value
+    assert error.fatal is False
+    assert not any(isinstance(r, proto.Audio) for r in replies)
+    assert not out.exists()
+
+
+def test_a_non_finite_peak_never_reaches_the_wire_as_bare_nan(engine, tmp_path):
+    # json.dumps writes NaN and Infinity as bare tokens, which RFC 8259 has
+    # no such thing as; json.loads accepts them, so a Python parent sees
+    # nothing wrong and any other client sees a syntax error.  F-55 carries
+    # this number onward into result metadata.
+    def reject(token: str) -> float:
+        raise AssertionError(f"{token} is not JSON and no other client will parse it")
+
+    engine.spec["waveform"] = [0.5, float("nan"), -0.5]
+    raw = drive_raw(load_request(), synth_request(tmp_path / "seg0.wav"))
+    for line in raw.splitlines():
+        if line.strip():
+            json.loads(line, parse_constant=reject)
+    # The word survives only inside the refusal that stopped it; no reply
+    # carries a peak at all, because no segment was produced.
+    assert '"peak"' not in raw
+    assert ":NaN" not in raw and ":Infinity" not in raw
 
 
 def test_synthesizing_before_loading_is_refused_without_killing_the_worker(engine, tmp_path):

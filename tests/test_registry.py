@@ -638,6 +638,7 @@ def test_loading_is_refused_over_budget_even_when_the_files_are_ready(
 
 def test_the_engine_is_given_the_app_owned_directory(registry: ModelRegistry) -> None:
     _install(registry.model_dir(MODEL_ID))
+    registry.accept_license(MODEL_ID)
     assert registry.prepared_dir(MODEL_ID, budget=ENOUGH) == registry.model_dir(MODEL_ID)
     assert registry.model_dir(MODEL_ID).parent == paths.model_cache_dir()
 
@@ -650,6 +651,7 @@ def test_a_verified_copy_in_the_package_cache_is_read_rather_than_redownloaded(
     registry = ModelRegistry(
         Manifest((entry,)), fetcher=fetcher, package_cache_dirs={MODEL_ID: package}
     )
+    registry.accept_license(MODEL_ID)
     path, borrowed = registry.resolve_dir(MODEL_ID)
     assert (path, borrowed) == (package, True)
     assert registry.status(MODEL_ID, deep=True).using_package_cache is True
@@ -657,6 +659,40 @@ def test_a_verified_copy_in_the_package_cache_is_read_rather_than_redownloaded(
     # Deleting the app's cache never reaches into another program's.
     registry.delete(MODEL_ID)
     assert (package / "onnx" / "graph.bin").exists()
+
+
+def test_weights_already_on_disk_still_need_the_licence_accepted(
+    registry: ModelRegistry,
+) -> None:
+    """N-11 gates preparation, and preparation is not the same as download.
+
+    A copy borrowed from another program's cache, or one prepared before a
+    release amended the restrictions, reaches the engine without any
+    download ever being asked for. A gate that only guarded the download
+    would be one both of those walk straight past.
+    """
+    _install(registry.model_dir(MODEL_ID))
+    with pytest.raises(EchoActError) as caught:
+        registry.resolve_dir(MODEL_ID)
+    assert caught.value.code is Code.MODEL_LICENSE_NOT_ACCEPTED
+
+    registry.accept_license(MODEL_ID)
+    path, borrowed = registry.resolve_dir(MODEL_ID)
+    assert (path, borrowed) == (registry.model_dir(MODEL_ID), False)
+
+
+def test_an_absent_model_reports_that_rather_than_the_licence(
+    registry: ModelRegistry,
+) -> None:
+    """Both are true; only one is useful.
+
+    Preparation is the flow that presents the terms, so a model that is not
+    on this machine is reported as not prepared. Answering with the licence
+    instead would send the owner to the wrong screen.
+    """
+    with pytest.raises(EchoActError) as caught:
+        registry.resolve_dir(MODEL_ID)
+    assert caught.value.code is Code.MODEL_NOT_READY
 
 
 def test_a_damaged_package_cache_is_not_borrowed(
@@ -765,6 +801,7 @@ def test_the_shipped_manifest_verifies_the_real_weights_where_they_already_are(
     # than downloaded again.
     registry = ModelRegistry()
     assert registry.state(DEFAULT_MODEL_ID) is ModelState.NOT_PRESENT
+    registry.accept_license(DEFAULT_MODEL_ID)
     path, borrowed = registry.resolve_dir(DEFAULT_MODEL_ID)
     assert borrowed is True
     assert path == Path.home() / ".cache" / "supertonic3"

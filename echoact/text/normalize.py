@@ -33,8 +33,8 @@ from __future__ import annotations
 import re
 import unicodedata
 from bisect import bisect_right
-from dataclasses import dataclass, field
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field
 from typing import Final
 
 from ..domain import TextRange
@@ -575,7 +575,7 @@ _RULES: Final[tuple[tuple[str, str], ...]] = (
     # reading only the "1" would speak a different list from the one written.
     # ``(?![-–~]\d)`` does the same for "010-1234-5678", which the range rule
     # above has already declined: a part of a phone number is not a number.
-    ("decimal", _LEFT + rf"(?:{_NUM})(?![\d.]*\d)\.\d+(?!,\d)(?![-–~]\d)(?![A-Za-z])"),
+    ("decimal", _LEFT + rf"(?:{_NUM})\.\d+(?![\d.])(?!,\d)(?![-–~]\d)(?![A-Za-z])"),
     ("integer", _LEFT + rf"(?:{_NUM})(?![\d.]*\d)(?!,\d)(?![-–~]\d)(?![A-Za-z])"),
     ("decorative", rf"[{_DECORATIVE_CLASS}]+"),
     ("space", r"\s+"),
@@ -811,7 +811,11 @@ class Normalized:
         if cursor != len(self.source):
             raise AssertionError(f"alignment covers {cursor} of {len(self.source)} code points")
         if produced != len(self.text):
-            raise AssertionError("alignment pieces do not concatenate to the normalised text")
+            # Lengths, not contents: the offsets are all the mappings use,
+            # and rebuilding the joined string here would double the cost of
+            # normalising a 50,000-character document to catch nothing that
+            # this module can produce.
+            raise AssertionError("alignment pieces do not span the normalised text")
         object.__setattr__(self, "_source_starts", tuple(source_starts))
         object.__setattr__(self, "_produced_starts", tuple(produced_starts))
 

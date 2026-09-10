@@ -43,6 +43,56 @@ def test_the_installed_runtime_offers_a_provider_the_allow_list_refuses():
     assert runtime.requested_providers() == ["CPUExecutionProvider"]
 
 
+def test_the_list_handed_to_construction_is_the_allow_list_not_a_default():
+    # F-87 pins "by an explicit allow-list ..., never by relying on a
+    # default", so this list exists to be *given* to whatever builds the
+    # sessions.  A caller may narrow it; the result is still an explicit
+    # list and still in allow-list order.
+    assert runtime.requested_providers(("CPUExecutionProvider",)) == ["CPUExecutionProvider"]
+    with pytest.raises(EchoActError) as caught:
+        runtime.requested_providers(("QuantumTeapotExecutionProvider",))
+    assert caught.value.code is Code.RUNTIME_PROVIDER_REFUSED
+
+
+def test_a_request_wider_than_the_product_allows_is_refused_and_says_why():
+    with pytest.raises(EchoActError) as caught:
+        runtime.resolve_allow_list(["CPUExecutionProvider", "CUDAExecutionProvider"])
+    assert caught.value.code is Code.RUNTIME_PROVIDER_REFUSED
+    assert caught.value.detail["refused"] == ["CUDAExecutionProvider"]
+    assert "accelerator" in caught.value.message
+
+
+def test_a_request_naming_nothing_we_allow_is_a_refusal_not_a_fall_back():
+    # An empty list must not quietly mean "the full allow-list": the field
+    # is the caller's statement of what it will accept.
+    with pytest.raises(EchoActError) as caught:
+        runtime.resolve_allow_list([])
+    assert caught.value.code is Code.RUNTIME_PROVIDER_REFUSED
+    assert runtime.resolve_allow_list(None) == runtime.ALLOWED_PROVIDERS
+
+
+def test_a_caller_may_narrow_the_allow_list_and_is_then_held_to_it(monkeypatch):
+    # Written against a hypothetical two-entry product list, because the
+    # narrowing has to work whatever ALLOWED_PROVIDERS grows to; today's
+    # single entry cannot tell "honoured" from "ignored".
+    monkeypatch.setattr(
+        runtime, "ALLOWED_PROVIDERS", ("CPUExecutionProvider", "XnnpackExecutionProvider")
+    )
+    narrowed = runtime.resolve_allow_list(["CPUExecutionProvider"])
+    assert narrowed == ("CPUExecutionProvider",)
+
+    # Allowed by the product, refused by the caller: the narrower list wins.
+    session = StubSession("XnnpackExecutionProvider")
+    assert runtime.assert_local_only(session) == ["XnnpackExecutionProvider"]
+    with pytest.raises(EchoActError) as caught:
+        runtime.assert_local_only(session, allowed=narrowed)
+    assert caught.value.detail["allowed"] == ["CPUExecutionProvider"]
+    with pytest.raises(EchoActError):
+        runtime.verify_sessions({"vocoder_ort": session}, allowed=narrowed)
+    with pytest.raises(EchoActError):
+        runtime.providers_in_use([session], allowed=narrowed)
+
+
 def test_a_remote_provider_is_refused_even_though_the_session_also_runs_on_cpu():
     session = StubSession("AzureExecutionProvider", "CPUExecutionProvider")
     with pytest.raises(EchoActError) as caught:

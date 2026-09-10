@@ -15,7 +15,13 @@ Everything that decides "sound" goes through the manifest.  Nothing here
 trusts a file because it exists, a size because a server reported it, or a
 directory because the last run left it behind.
 
-Three requirements shape the awkward parts:
+N-11's licence gate sits on the way to a *directory*, not only on the way to
+a download.  A model that is already on disk -- borrowed from the package
+cache above, or prepared before a release amended the restrictions -- is
+never downloaded again, so a gate that only guarded :meth:`ModelRegistry.download`
+would be one the two commonest cases walk straight past.
+
+Four requirements shape the awkward parts:
 
 * N-21 forbids reading a whole file into memory to hash it, and a
   verification pass over 385 MB has to be interruptible, so every read is a
@@ -24,8 +30,15 @@ Three requirements shape the awkward parts:
   data.  Downloads therefore stream into a ``.part`` file next to the target
   and are renamed into place only after the digest matches.  A cancelled or
   crashed download leaves a partial file that the next attempt resumes from
-  and that verification ignores -- so a cancelled download can never make a
-  model look ready, which F-64 requires in as many words.
+  and that verification ignores.  What a cancelled attempt *reports* rests on
+  digests as well -- the ones the opening pass computed and the ones the
+  transfer itself matched -- and never on a cheap size check, because a size
+  check would call a same-size tampered file sound and hand F-63's screen a
+  corrupt model described as ready.
+* N-23 forbids a repeated request multiplying the work.  Preparation of one
+  model is serialised for the whole process, so a second caller waits and
+  then finds the files already in place instead of streaming a second copy
+  through the same ``.part``.
 * Section 5.3 forbids an external caller triggering an arbitrary large
   download.  A download asked for over REST or MCP is refused unless the
   owner pre-authorised that model in the GUI.
@@ -70,6 +83,11 @@ _READ_TIMEOUT_S = 60.0
 
 #: How long a caller is told to wait before retrying a failed download.
 _DOWNLOAD_RETRY_AFTER_S = 5.0
+
+#: How long a caller queued behind another preparation of the same model
+#: waits before looking at its cancel token again.  N-22 allows five seconds
+#: to stop; a queued attempt gives up well inside that.
+_LOCK_POLL_S = 0.25
 
 _PART_SUFFIX = ".part"
 
@@ -658,15 +676,32 @@ class ModelRegistry:
 
         Raises rather than returning a doubtful path: F-84 says a model whose
         files do not match the manifest is reported as corrupted, not used.
+
+        The licence is checked here and not only in :meth:`download`, because
+        this is the path a model actually reaches the engine by (N-11, F-80,
+        A-23).  Neither case that matters passes through a download: the
+        package cache is read where it lies, and a release that amends
+        Attachment A leaves the files READY, so nothing would ever ask again.
+
+        It is checked *after* the files are found, not before.  N-11 makes
+        acceptance a condition of preparing a model, so for a model that is
+        not on this machine the useful answer is that it is not prepared --
+        which is the flow that presents the terms.  Reporting an unaccepted
+        licence for a model that also is not there would be true and
+        useless, and would send the owner to the wrong screen.
         """
         own = self.verify(model_id, deep=deep, cancel=cancel)
         if own.state is ModelState.READY:
+            self._require_license(self.entry(model_id))
             return self.model_dir(model_id), False
 
         fallback = self.package_cache_dir(model_id)
         if fallback is not None and fallback.is_dir():
             other = self.verify(model_id, deep=deep, cancel=cancel, root=fallback)
             if other.state is ModelState.READY:
+                # The case the gate exists for: borrowed weights reach the
+                # engine without a download ever being asked for.
+                self._require_license(self.entry(model_id))
                 log.info("model %s served from the package cache %s", model_id, redact(fallback))
                 return fallback, True
 
@@ -804,11 +839,36 @@ class ModelRegistry:
         which is what makes F-64's "a cancelled download is never shown as
         ready" true by construction rather than by a flag someone has to
         remember to clear.
+
+        Only one attempt per model runs at a time (N-23).  A second caller --
+        the GUI and a REST request, two REST requests, a repair overtaking a
+        download -- waits, and then its own verification pass finds the work
+        already done and fetches nothing.
         """
         entry = self.entry(model_id)
         self._require_license(entry)
         self._require_authorisation(entry, request_path)
 
+        with _preparing(self.model_dir(model_id), cancel) as held:
+            if not held:
+                # Cancelled while queued behind another attempt.  Nothing was
+                # examined, so nothing is claimed: the pass below runs with an
+                # already-cancelled token and reports every file unchecked.
+                return self._cancelled_outcome(
+                    entry, self.verify(model_id, cancel=cancel), progress_cb, 0, (), ()
+                )
+            return self._prepare(entry, progress_cb, cancel, discard_partial=discard_partial)
+
+    def _prepare(
+        self,
+        entry: ModelEntry,
+        progress_cb: ProgressCallback | None,
+        cancel: CancelToken | None,
+        *,
+        discard_partial: bool,
+    ) -> DownloadOutcome:
+        """:meth:`download`'s body, with this model's preparation lock held."""
+        model_id = entry.model_id
         report = self.verify(model_id, cancel=cancel, progress=progress_cb)
         if report.cancelled:
             return self._cancelled_outcome(entry, report, progress_cb, 0, (), ())
@@ -846,9 +906,13 @@ class ModelRegistry:
 
         for index, file in enumerate(todo):
             if _cancelled(cancel):
-                final = self.verify(model_id, deep=False)
                 return self._cancelled_outcome(
-                    entry, final, progress_cb, downloaded, reused, tuple(fetched)
+                    entry,
+                    self._interrupted_report(entry, report, fetched, None),
+                    progress_cb,
+                    downloaded,
+                    reused,
+                    tuple(fetched),
                 )
 
             def tick(
@@ -881,9 +945,13 @@ class ModelRegistry:
             )
             downloaded += written
             if cancelled:
-                final = self.verify(model_id, deep=False)
                 return self._cancelled_outcome(
-                    entry, final, progress_cb, downloaded, reused, tuple(fetched)
+                    entry,
+                    self._interrupted_report(entry, report, fetched, file.relative_path),
+                    progress_cb,
+                    downloaded,
+                    reused,
+                    tuple(fetched),
                 )
             fetched.append(file.relative_path)
 
@@ -961,7 +1029,8 @@ class ModelRegistry:
         """Stream one file into place.  Returns (bytes written, cancelled)."""
         target = file.path_under(base)
         part = target.with_name(target.name + _PART_SUFFIX)
-        target.parent.mkdir(parents=True, exist_ok=True)
+        with _writing(target.parent):
+            target.parent.mkdir(parents=True, exist_ok=True)
 
         # A target that exists here failed verification, so it is not
         # something to keep: F-64 re-downloads corrupted data.
@@ -1025,7 +1094,11 @@ class ModelRegistry:
                 hasher = hashlib.sha256()
                 offset = 0
             mode = "ab" if offset else "wb"
-            with part.open(mode) as sink:
+            # Opening, every write, and the flush at the end of the block are
+            # all inside ``_writing``: rule 3 lets no OSError out of here, and
+            # 5.3 wants a disk that fills mid-transfer reported as a failed
+            # save rather than as a crash.
+            with _writing(part), part.open(mode) as sink:
                 for chunk in body.chunks:
                     if _cancelled(cancel):
                         sink.flush()
@@ -1064,18 +1137,33 @@ class ModelRegistry:
         # named subdirectory of the model cache.
         if target == root or root not in target.parents:
             raise AssertionError(f"refusing to delete {target} outside {root}")
-        freed = _tree_bytes(target)
-        try:
-            shutil.rmtree(target)
-        except FileNotFoundError:
-            return 0
-        except OSError as exc:
+        # N-23: deleting the tree a download is streaming into would leave it
+        # renaming files into a directory nobody expects to exist.  Refused
+        # rather than queued, because F-65's delete is a GUI action and rule 7
+        # forbids the main thread waiting minutes for a transfer to finish.
+        lock = _prepare_lock(target)
+        if not lock.acquire(blocking=False):
             raise EchoActError(
-                Code.INTERNAL,
-                "The model files could not be deleted.",
-                detail={"model_id": entry.model_id, "path": redact(target)},
-                cause=exc,
-            ) from exc
+                Code.DELETE_BLOCKED_IN_USE,
+                "The model is being prepared; cancel that first.",
+                detail={"model_id": entry.model_id},
+                retry_after_s=_DOWNLOAD_RETRY_AFTER_S,
+            )
+        try:
+            freed = _tree_bytes(target)
+            try:
+                shutil.rmtree(target)
+            except FileNotFoundError:
+                return 0
+            except OSError as exc:
+                raise EchoActError(
+                    Code.INTERNAL,
+                    "The model files could not be deleted.",
+                    detail={"model_id": entry.model_id, "path": redact(target)},
+                    cause=exc,
+                ) from exc
+        finally:
+            lock.release()
         log.info("deleted model %s (%d bytes)", entry.model_id, freed)
         return freed
 
@@ -1195,6 +1283,57 @@ class ModelRegistry:
             )
         )
 
+    def _interrupted_report(
+        self,
+        entry: ModelEntry,
+        baseline: VerifyReport,
+        fetched: Iterable[str],
+        in_flight: str | None,
+    ) -> VerifyReport:
+        """What a cancelled attempt is entitled to say about the model.
+
+        F-64: a cancelled download is never shown as ready.  The only
+        evidence of soundness that exists at this point is a digest -- the
+        one the opening deep pass computed for a file the attempt did not
+        have to fetch, or the one the transfer matched before renaming a file
+        into place.  Verifying again here could only be a shallow pass, since
+        N-22 allows five seconds to stop and 385 MB does not hash in that;
+        and a shallow pass calls a same-size tampered file sound, so it would
+        let a cancellation report READY for a model the deep pass had just
+        called corrupt.  The deep verdicts are therefore carried forward
+        instead of being thrown away.
+
+        The file being written when the cancellation landed counts as
+        unknown: its target was removed before the transfer began, and only
+        a ``.part`` stands in its place.
+        """
+        done = set(fetched)
+        statuses: list[FileStatus] = []
+        for file in entry.files:
+            prior = baseline.status(file.relative_path)
+            if file.relative_path in done:
+                statuses.append(
+                    FileStatus(
+                        relative_path=file.relative_path,
+                        expected_bytes=file.byte_size,
+                        actual_bytes=file.byte_size,
+                        present=True,
+                        size_ok=True,
+                        digest_ok=True,
+                    )
+                )
+            elif prior is None or file.relative_path == in_flight:
+                statuses.append(_unchecked(file))
+            else:
+                statuses.append(prior)
+        return VerifyReport(
+            model_id=entry.model_id,
+            root=self.model_dir(entry.model_id),
+            files=tuple(statuses),
+            deep=baseline.deep,
+            cancelled=True,
+        )
+
     def _cancelled_outcome(
         self,
         entry: ModelEntry,
@@ -1221,6 +1360,74 @@ class ModelRegistry:
 # ======================================================================
 # Module helpers
 # ======================================================================
+
+
+#: One preparation lock per model directory, shared by every registry in
+#: this process.  N-23: two requests for one model must not become two
+#: transfers.  The ``.part`` path is derived from the model id and the file
+#: path alone, so two attempts open the same file -- one truncating while the
+#: other appends -- and the digest each computes over its own stream says
+#: nothing about the bytes that ended up on disk.  Keyed by directory rather
+#: than by model id, so two registries over one cache serialise and two over
+#: different caches do not.
+_PREPARE_LOCKS: dict[str, threading.RLock] = {}
+_PREPARE_LOCKS_GUARD = threading.Lock()
+
+
+def _prepare_lock(directory: Path) -> threading.RLock:
+    key = os.path.normcase(os.path.abspath(directory))
+    with _PREPARE_LOCKS_GUARD:
+        lock = _PREPARE_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _PREPARE_LOCKS[key] = lock
+        return lock
+
+
+@contextmanager
+def _preparing(directory: Path, cancel: CancelToken | None) -> Iterator[bool]:
+    """Hold one model's preparation lock (N-23).
+
+    Yields ``True`` with the lock held, or ``False`` when the caller
+    cancelled while waiting for the attempt in front of it -- the wait is
+    polled rather than indefinite so that N-22's five seconds to stop hold
+    for a queued attempt too.
+    """
+    lock = _prepare_lock(directory)
+    while not lock.acquire(timeout=_LOCK_POLL_S):
+        if _cancelled(cancel):
+            yield False
+            return
+    try:
+        yield True
+    finally:
+        lock.release()
+
+
+@contextmanager
+def _writing(path: Path) -> Iterator[None]:
+    """Convert a failed write into this module's own error (rule 3, 5.3).
+
+    :meth:`ModelRegistry._require_space` cannot stand in for this.  It asks
+    once, before a transfer that runs for minutes: it does not see another
+    process taking the last of the disk in the meantime, a cache directory
+    that turns out to be read-only, or a scanner holding the ``.part`` open
+    -- and on a volume whose free space cannot be read at all it declines to
+    answer and lets the transfer start anyway.
+    """
+    try:
+        yield
+    except OSError as exc:
+        out_of_room = exc.errno in (errno.ENOSPC, errno.EDQUOT)
+        raise EchoActError(
+            Code.STORAGE_FULL if out_of_room else Code.MODEL_DOWNLOAD_FAILED,
+            "There is not enough free disk space to finish preparing this model."
+            if out_of_room
+            else "The model file could not be written to the cache.",
+            detail={"path": redact(path)},
+            retry_after_s=None if out_of_room else _DOWNLOAD_RETRY_AFTER_S,
+            cause=exc,
+        ) from exc
 
 
 def _sha256_file(

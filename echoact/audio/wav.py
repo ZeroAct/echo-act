@@ -247,7 +247,7 @@ def write_segment(
     pcm, frame_count, peak, clipped = _to_pcm(samples)
     target = Path(path)
     _check_capacity(len(pcm), target)
-    with _open_writer(target, sample_rate) as writer:
+    with _open_writer(target, sample_rate, expect_pcm_bytes=len(pcm)) as writer:
         writer.writeframesraw(pcm)
     return WriteReport(
         path=str(target),
@@ -360,21 +360,32 @@ def iter_blocks(
     The file is checked before the iterator is returned, not on the first
     ``next``: a player that builds its source ahead of time should learn
     about a missing or foreign file then, not mid-stream.
+
+    A file that runs out of audio early is reported once the stream ends
+    rather than passed off as a whole one, exactly as :func:`read_wav`
+    reports it.  This is the path a retained result is streamed and played
+    through, so a truncated file would otherwise play short with nothing
+    said, which is what F-55 forbids.  A caller that deliberately stops
+    early never reaches the check, which is right: it asked for a prefix.
     """
     if block_frames <= 0:
         raise EchoActError(Code.INTERNAL, "A block must contain at least one frame.")
     target = Path(path)
-    require_output_format(probe(target))
-    return _iter_blocks(target, block_frames)
+    info = probe(target)
+    require_output_format(info)
+    return _iter_blocks(target, block_frames, info.frame_count)
 
 
-def _iter_blocks(target: Path, block_frames: int) -> Iterator[np.ndarray]:
+def _iter_blocks(target: Path, block_frames: int, expected_frames: int) -> Iterator[np.ndarray]:
+    seen = 0
     with _open_reader(target) as reader:
         while True:
             raw = _read_block(reader, block_frames, target)
             if not raw:
-                return
+                break
+            seen += len(raw) // SAMPLE_WIDTH_BYTES
             yield np.frombuffer(raw, dtype="<i2").astype(np.int16, copy=True)
+    _require_frame_count(seen, expected_frames, target)
 
 
 def require_output_format(info: WavInfo) -> None:
@@ -443,6 +454,13 @@ def concatenate(
     Every input is probed before the output is opened, so a mixed rate or a
     damaged segment fails without leaving a file behind.  Frames are copied
     in blocks and never accumulated (N-21).
+
+    The frames copied are counted against what each probe promised, and the
+    finished size is checked while the file is still the ``.part``: a short
+    join caught after the rename has already put a complete-looking,
+    playable, short result where the caller asked for the real one, which is
+    F-55's "incomplete file returned as finished" in its worst form, since
+    nothing about the file itself says it is short.
     """
     paths = [None if p is None else Path(p) for p in segment_paths]
     gaps = [int(g) for g in gaps_ms]
@@ -486,20 +504,15 @@ def concatenate(
     target = Path(out_path)
     _check_capacity(total_frames * SAMPLE_WIDTH_BYTES, target)
 
-    with _open_writer(target, sample_rate) as writer:
-        for source, silence in zip(paths, gap_frames, strict=True):
+    with _open_writer(
+        target, sample_rate, expect_pcm_bytes=total_frames * SAMPLE_WIDTH_BYTES
+    ) as writer:
+        for source, frames, silence in zip(paths, segment_frames, gap_frames, strict=True):
             if source is not None:
-                _copy_frames(source, writer)
+                _copy_frames(source, writer, frames)
             _write_silence(writer, silence)
 
     byte_size = _size_of(target)
-    written = byte_size - CANONICAL_HEADER_BYTES
-    if written != total_frames * SAMPLE_WIDTH_BYTES:
-        raise EchoActError(
-            Code.INTERNAL,
-            "The joined file is not the size its segments add up to.",
-            detail={"expected": total_frames * SAMPLE_WIDTH_BYTES, "found": written},
-        )
     return ConcatReport(
         path=str(target),
         sample_rate=sample_rate,
@@ -605,7 +618,18 @@ def _spans(
 
 
 @contextmanager
-def _open_writer(path: Path, sample_rate: int) -> Iterator[wave.Wave_write]:
+def _open_writer(
+    path: Path,
+    sample_rate: int,
+    *,
+    expect_pcm_bytes: int | None = None,
+) -> Iterator[wave.Wave_write]:
+    """Write beside ``path`` and publish by rename, never a partial file.
+
+    ``expect_pcm_bytes`` is checked on the temporary after ``close()`` has
+    patched the RIFF sizes and before the rename, so a body that wrote less
+    than it promised destroys its work instead of publishing it.
+    """
     if sample_rate <= 0:
         raise EchoActError(Code.INTERNAL, "A sample rate must be positive.")
     temp = path.with_name(path.name + _PART_SUFFIX)
@@ -647,10 +671,14 @@ def _open_writer(path: Path, sample_rate: int) -> Iterator[wave.Wave_write]:
         _discard(temp)
         raise
     try:
+        _require_pcm_bytes(temp, expect_pcm_bytes, path)
         os.replace(temp, path)
     except OSError as exc:
         _discard(temp)
         raise _os_error(exc, path) from exc
+    except BaseException:
+        _discard(temp)
+        raise
 
 
 @contextmanager
@@ -673,13 +701,24 @@ def _open_reader(path: Path) -> Iterator[wave.Wave_read]:
         reader.close()
 
 
-def _copy_frames(source: Path, writer: wave.Wave_write) -> None:
+def _copy_frames(source: Path, writer: wave.Wave_write, expected_frames: int) -> None:
+    """Copy one segment, refusing to join a file that stops short.
+
+    ``readframes`` returns what is there and then returns nothing; it cannot
+    tell a truncated data chunk from the end of a whole one.  Without the
+    count, a short segment would be joined happily and only the finished
+    size would betray it -- and a size checked after the rename is checked
+    on the caller's file, not on ours.
+    """
+    copied = 0
     with _open_reader(source) as reader:
         while True:
             raw = _read_block(reader, BLOCK_FRAMES, source)
             if not raw:
-                return
+                break
             writer.writeframesraw(raw)
+            copied += len(raw) // SAMPLE_WIDTH_BYTES
+    _require_frame_count(copied, expected_frames, source)
 
 
 def _write_silence(writer: wave.Wave_write, frames: int) -> None:
@@ -705,13 +744,32 @@ def _read_block(reader: wave.Wave_read, frames: int, path: Path) -> bytes:
 
 def _read_all(reader: wave.Wave_read, frames: int, path: Path) -> bytes:
     raw = _read_block(reader, frames, path)
-    if len(raw) != frames * SAMPLE_WIDTH_BYTES:
-        raise EchoActError(
-            Code.FILE_CORRUPT,
-            "That WAV holds less audio than its header declares.",
-            detail={"path": redact(path)},
-        )
+    _require_frame_count(len(raw) // SAMPLE_WIDTH_BYTES, frames, path)
     return raw
+
+
+def _require_frame_count(found: int, expected: int, path: Path) -> None:
+    """Hold a read to the frame count :func:`probe` reported for the file."""
+    if found == expected:
+        return
+    raise EchoActError(
+        Code.FILE_CORRUPT,
+        "That WAV holds less audio than its header declares.",
+        detail={"path": redact(path), "expected_frames": expected, "found_frames": found},
+    )
+
+
+def _require_pcm_bytes(temp: Path, expected: int | None, path: Path) -> None:
+    """Hold a written file to the payload its caller said it would contain."""
+    if expected is None:
+        return
+    written = _size_of(temp) - CANONICAL_HEADER_BYTES
+    if written != expected:
+        raise EchoActError(
+            Code.INTERNAL,
+            "The file written is not the size its audio adds up to.",
+            detail={"path": redact(path), "expected": expected, "found": written},
+        )
 
 
 def _check_capacity(pcm_bytes: int, path: Path) -> None:

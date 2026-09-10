@@ -148,11 +148,22 @@ def isolated(tmp_path, monkeypatch):
     paths.data_dir.cache_clear()
 
 
+def _registry(tmp_path) -> ModelRegistry:
+    """A registry with the licence already accepted.
+
+    N-11 gates preparation on acceptance and there is a separate test for
+    that gate; these tests are about what happens once it is past.
+    """
+    reg = ModelRegistry(MANIFEST, root=tmp_path / "models")
+    reg.accept_license(SUPERTONIC_3_ID)
+    return reg
+
+
 @pytest.fixture()
 def engine(tmp_path):
     store = Store(tmp_path / "db.sqlite3", audio_root=tmp_path / "audio")
     sup = FakeSupervisor()
-    reg = ModelRegistry(MANIFEST, root=tmp_path / "models")
+    reg = _registry(tmp_path)
     eng = JobEngine(
         store=store,
         supervisor=sup,
@@ -259,7 +270,7 @@ def test_a_second_job_is_refused_as_busy_with_a_hint(tmp_path) -> None:
     eng = JobEngine(
         store=store,
         supervisor=sup,
-        registry=ModelRegistry(MANIFEST, root=tmp_path / "models"),
+        registry=_registry(tmp_path),
         manifest=MANIFEST,
         settings=Settings(voice=_voice()),
         work_dir=tmp_path / "work",
@@ -285,7 +296,7 @@ def test_a_busy_refusal_does_not_consume_the_key(tmp_path) -> None:
     eng = JobEngine(
         store=store,
         supervisor=sup,
-        registry=ModelRegistry(MANIFEST, root=tmp_path / "models"),
+        registry=_registry(tmp_path),
         manifest=MANIFEST,
         settings=Settings(voice=_voice()),
         work_dir=tmp_path / "work",
@@ -338,7 +349,7 @@ def test_cancel_releases_the_slot_within_five_seconds(tmp_path) -> None:
     eng = JobEngine(
         store=store,
         supervisor=sup,
-        registry=ModelRegistry(MANIFEST, root=tmp_path / "models"),
+        registry=_registry(tmp_path),
         manifest=MANIFEST,
         settings=Settings(voice=_voice()),
         work_dir=tmp_path / "work",
@@ -389,7 +400,7 @@ def test_a_bounded_wait_that_lapses_leaves_the_job_alone(tmp_path) -> None:
     eng = JobEngine(
         store=store,
         supervisor=sup,
-        registry=ModelRegistry(MANIFEST, root=tmp_path / "models"),
+        registry=_registry(tmp_path),
         manifest=MANIFEST,
         settings=Settings(voice=_voice()),
         work_dir=tmp_path / "work",
@@ -461,7 +472,7 @@ def test_a_failed_segment_fails_the_job_and_releases_the_model(tmp_path) -> None
     eng = JobEngine(
         store=store,
         supervisor=sup,
-        registry=ModelRegistry(MANIFEST, root=tmp_path / "models"),
+        registry=_registry(tmp_path),
         manifest=MANIFEST,
         settings=Settings(voice=_voice()),
         work_dir=tmp_path / "work",
@@ -509,7 +520,7 @@ def test_the_real_engine_produces_a_playable_result(tmp_path) -> None:
     """The fake above must not drift away from the real supervisor."""
     from echoact.engine.supervisor import WorkerSupervisor
 
-    reg = ModelRegistry(MANIFEST, root=tmp_path / "models")
+    reg = _registry(tmp_path)
     try:
         reg.resolve_dir(SUPERTONIC_3_ID)
     except EchoActError:

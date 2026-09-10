@@ -279,6 +279,51 @@ def test_an_origin_table_cannot_grow_without_bound(clock):
     assert auth.tracked_origins <= 8
 
 
+def test_locking_an_origin_out_does_not_buy_it_an_uncapped_table_entry(clock):
+    """The shape one failure per origin never reaches: every origin locks.
+
+    Ten failures move an origin from the failure table to the lockout table.
+    If only the failure table is capped, an inventor of origins pays ten
+    attempts for a table entry nothing ever bounds.
+    """
+    auth = AuthFailureLimiter(clock=clock, max_origins=4)
+    for i in range(500):
+        for _ in range(AUTH_FAILURES_PER_MIN):
+            auth.record_failure(f"origin-{i}")
+    assert auth.tracked_origins <= 4
+
+
+def test_sweep_reports_exactly_the_origins_it_reclaimed(auth, clock):
+    for i in range(3):
+        for _ in range(AUTH_FAILURES_PER_MIN):
+            auth.record_failure(f"origin-{i}")
+    assert auth.tracked_origins == 3, "a locked origin is still a tracked origin"
+
+    # Mid-lockout there is nothing to reclaim: a locked origin's spent
+    # failure window is not free space, or F-69's screen is told the table
+    # emptied while every one of those origins is still locked out.
+    assert auth.sweep() == 0
+    assert auth.tracked_origins == 3
+    assert auth.check("origin-0").locked is True
+
+    clock.advance(AUTH_LOCKOUT_S + 1.0)
+    assert auth.sweep() == 3
+    assert auth.tracked_origins == 0
+
+
+def test_a_full_table_of_lockouts_still_says_when_to_come_back(clock):
+    auth = AuthFailureLimiter(clock=clock, max_origins=1)
+    for _ in range(AUTH_FAILURES_PER_MIN):
+        auth.record_failure("127.0.0.1")
+    clock.advance(20.0)
+
+    state = auth.record_failure("10.0.0.9")
+    assert state.locked is True
+    # The one tracked origin is locked out, not counting failures, so the
+    # slot frees when its lockout ends -- not at some default minute.
+    assert state.retry_after_s == pytest.approx(AUTH_LOCKOUT_S - 20.0)
+
+
 def test_at_the_origin_cap_an_attempt_is_refused_rather_than_forgotten(clock):
     auth = AuthFailureLimiter(clock=clock, max_origins=1)
     auth.record_failure("127.0.0.1")

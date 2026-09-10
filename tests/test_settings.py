@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
+import threading
 from pathlib import Path
 
 import pytest
@@ -12,12 +14,15 @@ from echoact import paths
 from echoact.config.settings import (
     DEFAULT_MODEL_ID,
     DEFAULT_VOICE_ID,
+    SETTINGS_SCHEMA_VERSION,
     DisplayLanguage,
     Settings,
+    SettingsModelPreferences,
     SettingsStore,
     VoicePreset,
     load_settings,
     os_display_language,
+    output_device_key,
     save_settings,
 )
 from echoact.domain import Budget, Gender, Language, SpeakingStyle, VoiceSettings
@@ -98,7 +103,7 @@ def test_every_remembered_setting_survives_a_save_and_reload() -> None:
         follow=False,
         volume=0.4,
         muted=True,
-        output_device="Speakers (Realtek)",
+        output_device=output_device_key("MME", "Speakers (Realtek)"),
         display_language=DisplayLanguage.KO,
         os_notifications=True,
         rest_enabled=False,
@@ -476,3 +481,355 @@ def test_the_store_writes_where_paths_says(data_dir: Path) -> None:
     assert store.path == data_dir / "settings.json"
     store.save(Settings())
     assert store.path.exists()
+
+
+# ---------------------------------------- numbers JSON has and Python has not ---
+
+
+def _write(text: str) -> None:
+    paths.settings_path().parent.mkdir(parents=True, exist_ok=True)
+    paths.settings_path().write_text(text, encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("document", "field", "expected"),
+    [
+        ('{"memory_bytes": NaN}', "memory_bytes", None),
+        ('{"memory_bytes": Infinity}', "memory_bytes", MEMORY_CEILING_BYTES),
+        ('{"memory_bytes": -Infinity}', "memory_bytes", MEMORY_FLOOR_BYTES),
+        ('{"cpu_percent": Infinity}', "cpu_percent", 70),
+        ('{"cpu_percent": NaN}', "cpu_percent", CPU_PERCENT_DEFAULT),
+        ('{"rest_port": NaN}', "rest_port", REST_PORT_DEFAULT),
+        ('{"rest_port": Infinity}', "rest_port", 65535),
+        ('{"credential_days": -Infinity}', "credential_days", 1),
+        ('{"retention_bytes": 1e400}', "retention_bytes", RETENTION_MAX_BYTES),
+        (
+            '{"retention_bytes": ' + "1" + "0" * 400 + "}",
+            "retention_bytes",
+            RETENTION_MAX_BYTES,
+        ),
+        ('{"volume": NaN}', "volume", 1.0),
+        ('{"volume": 1e400}', "volume", 1.0),
+    ],
+)
+def test_a_number_json_allows_but_python_cannot_convert_never_stops_the_launch(
+    document: str, field: str, expected: object
+) -> None:
+    """F-24: load repairs every field on its own and never raises.
+
+    ``json.loads`` reads ``NaN`` and ``Infinity``, and a JSON integer literal
+    has no size limit, so a hand-edited file can hold values that ``int()``
+    and ``float()`` refuse outright rather than merely dislike.
+    """
+    _write(document)
+
+    settings, problems = load_settings()
+
+    assert getattr(settings, field) == expected
+    assert [p.code for p in problems] == [Code.FILE_CORRUPT]
+
+
+def test_a_preset_tempo_that_is_not_a_number_does_not_stop_the_launch() -> None:
+    payload = Settings().to_dict()
+    payload["presets"] = [{"name": "P", "voice": _voice().to_dict()}]
+    _write(json.dumps(payload).replace('"tempo": 1.25', '"tempo": NaN'))
+
+    settings, problems = load_settings()
+
+    assert settings.presets[0].voice.tempo == TEMPO_DEFAULT
+    assert Code.TEMPO_OUT_OF_RANGE in [p.code for p in problems]
+    settings.presets[0].voice.validate()
+
+
+def test_a_value_that_could_never_be_read_back_is_refused_before_the_file_is_written() -> None:
+    """The app must not be able to write a settings file it cannot load.
+
+    ``json.dumps`` spells a float infinity ``Infinity`` unless told not to, so
+    one unchecked ``update`` used to leave a file that failed every launch
+    afterwards.  The last sound file stays exactly as it was instead.
+    """
+    store = SettingsStore()
+    store.save(Settings(cpu_percent=30))
+    sound = paths.settings_path().read_bytes()
+
+    with pytest.raises(EchoActError) as caught:
+        store.update(memory_bytes=float("inf"))
+
+    assert caught.value.code is Code.INTERNAL
+    assert paths.settings_path().read_bytes() == sound
+    assert store.current.cpu_percent == 30
+    assert load_settings()[0].memory_bytes is None
+
+
+# ----------------------------------------------- two saves at once, N-14 ---
+
+
+def _pause_first_fsync(monkeypatch: pytest.MonkeyPatch) -> tuple[threading.Event, threading.Event]:
+    """Hold the first ``save_settings`` inside ``fsync``, temp file on disk."""
+    reached = threading.Event()
+    release = threading.Event()
+    real_fsync = os.fsync
+
+    def hold(fd: int) -> None:
+        real_fsync(fd)
+        if not reached.is_set():
+            reached.set()
+            assert release.wait(10), "the paused save was never released"
+
+    monkeypatch.setattr(os, "fsync", hold)
+    return reached, release
+
+
+def test_two_saves_at_once_do_not_write_to_the_same_temporary_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """N-14: the save that lands has to be the save that reported success.
+
+    A temp name fixed per process is shared by every concurrent save in that
+    process: the second writer truncates the first's payload and the two
+    renames race, so one caller's content lands while the *other* caller is
+    told it saved.
+    """
+    reached, release = _pause_first_fsync(monkeypatch)
+    failures: list[BaseException] = []
+
+    def slow_save() -> None:
+        try:
+            save_settings(Settings(cpu_percent=70).save_preset("Podcast", _voice()))
+        except BaseException as exc:  # noqa: BLE001 - reported by the assertion below
+            failures.append(exc)
+
+    first = threading.Thread(target=slow_save)
+    first.start()
+    assert reached.wait(10)
+
+    target = paths.settings_path()
+    temporaries = [p for p in target.parent.iterdir() if p != target]
+    assert len(temporaries) == 1, "the paused save should own exactly one temporary file"
+    held = temporaries[0]
+    held_payload = held.read_text(encoding="utf-8")
+
+    save_settings(Settings(cpu_percent=11))  # a whole second save, start to finish
+
+    assert held.read_text(encoding="utf-8") == held_payload, "the second save reused the temp file"
+    assert json.loads(target.read_text(encoding="utf-8"))["cpu_percent"] == 11
+
+    release.set()
+    first.join(10)
+    assert not failures, f"the paused save failed: {failures}"
+    landed = json.loads(target.read_text(encoding="utf-8"))
+    assert (landed["cpu_percent"], len(landed["presets"])) == (70, 1)
+    assert [p.name for p in target.parent.iterdir()] == [target.name]
+
+
+def test_the_store_serialises_updates_so_the_first_one_is_not_lost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The GUI, the REST service and MCP all change settings from their own
+    threads; an unguarded read-modify-write drops whichever change reaches the
+    file first while telling both callers they succeeded."""
+    store = SettingsStore()
+    store.load()
+    reached, release = _pause_first_fsync(monkeypatch)
+    done = threading.Event()
+    failures: list[BaseException] = []
+
+    def call(**kw: object) -> None:
+        try:
+            store.update(**kw)
+        except BaseException as exc:  # noqa: BLE001 - reported by the assertion below
+            failures.append(exc)
+
+    def second_update() -> None:
+        call(rest_port=9100)
+        done.set()
+
+    first = threading.Thread(target=call, kwargs={"cpu_percent": 70})
+    first.start()
+    assert reached.wait(10)
+
+    second = threading.Thread(target=second_update)
+    second.start()
+    assert not done.wait(0.3), "the second update did not wait for the first to land"
+
+    release.set()
+    first.join(10)
+    second.join(10)
+    assert not failures, f"an update failed: {failures}"
+
+    written = json.loads(paths.settings_path().read_text(encoding="utf-8"))
+    assert (written["cpu_percent"], written["rest_port"]) == (70, 9100)
+    assert (store.current.cpu_percent, store.current.rest_port) == (70, 9100)
+
+
+# ------------------------------------------ presets are clamped too, F-07 ---
+
+
+def test_a_preset_restored_from_disk_is_clamped_like_the_voice_it_replaces() -> None:
+    """F-66's presets reach ``Settings.voice`` by their own route out of the
+    file, so F-07's range has to be enforced on both."""
+    payload = Settings().to_dict()
+    payload["presets"] = [{"name": "evil", "voice": {**_voice().to_dict(), "tempo": 99.0}}]
+    _write(json.dumps(payload))
+
+    settings, problems = load_settings()
+
+    assert settings.presets[0].voice.tempo == TEMPO_MAX
+    assert Code.TEMPO_OUT_OF_RANGE in [p.code for p in problems]
+
+    applied = settings.apply_preset("evil")
+    assert applied.voice.tempo == TEMPO_MAX
+    applied.voice.validate()
+
+
+def test_a_preset_field_this_version_does_not_know_falls_back_like_the_voice() -> None:
+    payload = Settings().to_dict()
+    payload["presets"] = [{"name": "P", "voice": {**_voice().to_dict(), "style": "martian"}}]
+    _write(json.dumps(payload))
+
+    settings, problems = load_settings()
+
+    assert settings.presets[0].voice.style is SpeakingStyle.NATURAL
+    assert [p.code for p in problems] == [Code.STYLE_UNKNOWN]
+
+
+# ---------------------------------------------- the version marker, N-15 ---
+
+
+def test_a_file_from_a_newer_version_is_not_interpreted_under_this_versions_rules() -> None:
+    """N-15.  A key this build recognises may mean something else in the
+    format that wrote it, so none of them is read."""
+    _write(
+        json.dumps(
+            {
+                "version": SETTINGS_SCHEMA_VERSION + 6,
+                "cpu_percent": 55,
+                "retention_bytes": 7,
+                "future_thing": 1,
+            }
+        )
+    )
+
+    settings, problems = load_settings()
+
+    assert settings.schema_version == SETTINGS_SCHEMA_VERSION + 6
+    assert settings.from_a_newer_version is True
+    assert settings.cpu_percent == CPU_PERCENT_DEFAULT
+    assert settings.extra == {"future_thing": 1}
+    assert [p.code for p in problems] == [Code.FILE_UNSUPPORTED]
+
+
+def test_a_file_from_a_newer_version_is_never_written_over() -> None:
+    """N-15: an older app does not destructively modify a newer format."""
+    document = json.dumps({"version": SETTINGS_SCHEMA_VERSION + 6, "cpu_percent": 55})
+    _write(document)
+    store = SettingsStore()
+
+    with pytest.raises(EchoActError) as caught:
+        store.update(cpu_percent=33)
+
+    assert caught.value.code is Code.FILE_UNSUPPORTED
+    assert paths.settings_path().read_text(encoding="utf-8") == document
+
+
+def test_this_versions_marker_is_written_and_read_back() -> None:
+    save_settings(Settings(cpu_percent=33))
+    written = json.loads(paths.settings_path().read_text(encoding="utf-8"))
+    assert written["version"] == SETTINGS_SCHEMA_VERSION
+
+    settings, problems = load_settings()
+
+    assert (settings.schema_version, settings.cpu_percent) == (SETTINGS_SCHEMA_VERSION, 33)
+    assert problems == ()
+
+
+def test_an_unreadable_version_marker_does_not_lock_the_user_out_of_their_settings() -> None:
+    _write(json.dumps({"version": "seven", "cpu_percent": 33}))
+
+    settings, problems = load_settings()
+
+    assert settings.cpu_percent == 33
+    assert settings.from_a_newer_version is False
+    assert [p.code for p in problems] == [Code.FILE_CORRUPT]
+
+
+# ---------------------------- one home for the owner's two decisions, N-11 ---
+
+
+def test_the_model_registry_can_be_handed_the_settings_file_as_its_preferences() -> None:
+    """F-09 / N-11: ``ModelPreferences`` is the shape the registry asks for,
+    and N-11 and 5.3 both put these records in settings."""
+    from echoact.models.registry import ModelPreferences
+
+    prefs = SettingsModelPreferences(SettingsStore())
+
+    for name in (
+        "license_accepted",
+        "record_license_acceptance",
+        "download_authorised",
+        "set_download_authorised",
+    ):
+        wanted = inspect.signature(getattr(ModelPreferences, name))
+        wanted = wanted.replace(parameters=list(wanted.parameters.values())[1:])
+        assert inspect.signature(getattr(prefs, name)) == wanted, name
+
+
+def test_a_licence_accepted_through_the_registry_is_the_one_settings_reports() -> None:
+    """N-11's gate must be answered by one record, not two that can disagree."""
+    from echoact.models.registry import ModelRegistry
+
+    store = SettingsStore()
+    registry = ModelRegistry(preferences=SettingsModelPreferences(store))
+    assert registry.license_acceptance_required(DEFAULT_MODEL_ID) is True
+
+    registry.accept_license(DEFAULT_MODEL_ID)
+
+    assert registry.license_acceptance_required(DEFAULT_MODEL_ID) is False
+    assert list(store.current.accepted_licences) == [DEFAULT_MODEL_ID]
+    assert not (store.path.parent / "model_state.json").exists()
+
+
+def test_a_download_authorisation_survives_a_restart_of_the_store() -> None:
+    """5.3: the pre-authorisation an integration is checked against is the one
+    the owner set, read back from the settings file."""
+    prefs = SettingsModelPreferences(SettingsStore())
+    assert prefs.download_authorised(DEFAULT_MODEL_ID) is False
+
+    prefs.set_download_authorised(DEFAULT_MODEL_ID, True)
+    assert SettingsModelPreferences(SettingsStore()).download_authorised(DEFAULT_MODEL_ID) is True
+
+    prefs.set_download_authorised(DEFAULT_MODEL_ID, False)
+    assert SettingsModelPreferences(SettingsStore()).download_authorised(DEFAULT_MODEL_ID) is False
+
+
+# ------------------------------------------ the remembered speaker, F-67 ---
+
+
+def test_the_remembered_output_device_is_the_key_the_audio_module_resolves(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F-67: a speaker that is present must not read back as one that is gone.
+
+    ``devices.resolve`` matches on ``OutputDevice.key`` and nothing else, so
+    settings has to hold that spelling; a bare device name matches nothing,
+    and ``resolve`` defines nothing as "the remembered device is gone".
+    """
+    from echoact.audio import devices
+
+    speaker = devices.OutputDevice(
+        index=3,
+        name="Speakers (Realtek High Definition Audio)",
+        host_api="MME",
+        max_channels=2,
+        default_samplerate=44100.0,
+        is_default=True,
+    )
+    monkeypatch.setattr(devices, "list_output_devices", lambda: [speaker])
+    assert output_device_key(speaker.host_api, speaker.name) == speaker.key
+
+    save_settings(Settings(output_device=output_device_key(speaker.host_api, speaker.name)))
+    restored, problems = load_settings()
+
+    assert problems == ()
+    assert devices.resolve(restored.output_device) == speaker
+    assert devices.resolve(speaker.name) is None, "a bare name is not what this field holds"

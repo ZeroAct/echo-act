@@ -14,11 +14,23 @@ not configurable and stay in ``echoact.policy``; a value read back from disk is
 clamped against them rather than trusted, because a hand-edited or truncated
 settings file must never widen a limit.
 
-Writing is atomic (temp file, fsync, ``os.replace``).  N-14 requires previously
-sound data to survive a save that fails midway, and settings are the state the
-app rewrites most often, so a partial write here is the likeliest way to lose
-it.  Reading is the mirror image: an unreadable or damaged file yields defaults
-plus a reported ``Problem``, never an exception that stops the app launching.
+Writing is atomic (a temp file made unique per *call*, fsync, ``os.replace``).
+N-14 requires previously sound data to survive a save that fails midway, and
+settings are the state the app rewrites most often, so a partial write here is
+the likeliest way to lose it.  Two saves running at once must not share a temp
+file either: they would interleave into one payload and each rename would
+report the other's outcome, which loses an update while calling it a success.
+Reading is the mirror image: an unreadable or damaged file yields defaults plus
+a reported ``Problem``, never an exception that stops the app launching -- down
+to the values JSON can carry but Python's ``int()`` and ``float()`` refuse,
+``NaN``, ``Infinity``, and an integer literal too large for a float.
+
+A file stamped with a ``version`` newer than this build writes is not read and
+not rewritten (N-15).  Interpreting the keys it happens to share with this
+version would apply a v1 meaning to a v2 value, and saving afterwards would
+stamp the v1 meaning back over the file -- destroying the newer settings that
+N-15 exists to protect.  Such a file yields defaults, a reported ``Problem``,
+and a refusal to save until the newer build is used again.
 """
 
 from __future__ import annotations
@@ -26,9 +38,12 @@ from __future__ import annotations
 import errno
 import json
 import locale
+import math
 import os
 import sys
-from collections.abc import Iterable, Mapping
+import tempfile
+import threading
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
@@ -154,8 +169,26 @@ class VoicePreset:
         return {"name": self.name, "voice": self.voice.to_dict()}
 
     @classmethod
-    def from_dict(cls, d: Mapping[str, Any]) -> VoicePreset:
-        return cls(name=str(d["name"]), voice=VoiceSettings.from_dict(dict(d["voice"])))
+    def from_dict(
+        cls, d: Mapping[str, Any], problems: list[Problem] | None = None
+    ) -> VoicePreset:
+        """Read one preset, clamped exactly like ``Settings.voice``.
+
+        ``VoiceSettings.from_dict`` is deliberately *not* used: it trusts the
+        mapping and never calls ``validate()``, so a hand-edited file could
+        park a 99x tempo in a preset and ``apply_preset`` would copy it into
+        ``Settings.voice``, past the clamp that guards the voice read from the
+        same file.  F-07's range must hold for every route out of the file,
+        and a preset is one of them.  Repairs are appended to ``problems``
+        when the caller is collecting them for F-25.
+        """
+        voice = d["voice"]
+        if not isinstance(voice, Mapping):
+            raise TypeError("a preset's voice must be a table")
+        return cls(
+            name=str(d["name"]),
+            voice=_read_voice(voice, _default_voice(), [] if problems is None else problems),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,6 +216,21 @@ class ResourcePolicyView:
             self.configured_memory_bytes is not None
             and self.applied.memory_bytes != self.configured_memory_bytes
         )
+
+
+def output_device_key(host_api: str, name: str) -> str:
+    """The one spelling of a remembered output device (F-67).
+
+    ``echoact.audio.devices`` owns this format -- ``OutputDevice.key`` builds
+    it and ``devices.resolve`` compares against it exactly -- and settings
+    only stores it.  It is a function here rather than a sentence in a
+    docstring so that a caller holding a device cannot invent a second
+    spelling: a bare device name resolves to no device, which ``resolve``
+    defines as "the remembered device is gone", so F-67 would pause playback
+    on a speaker that is present and working, every launch.
+    ``tests/test_settings.py`` pins this against the real ``OutputDevice``.
+    """
+    return f"{host_api}::{name}"
 
 
 def _default_display_language() -> DisplayLanguage:
@@ -225,10 +273,16 @@ class Settings:
     follow: bool = FOLLOW_DEFAULT
     volume: float = PLAYBACK_VOLUME_DEFAULT
     muted: bool = False
-    #: The output device's stable name, not a PortAudio index.  Indices are
+    #: The remembered output device's key: exactly the string
+    #: ``echoact.audio.devices.OutputDevice.key`` produces, built by
+    #: :func:`output_device_key`.  Not a PortAudio index -- indices are
     #: reassigned whenever a device appears or disappears, so remembering one
-    #: would make the app open a *different* speaker after a reboot -- exactly
-    #: the unconfirmed switch F-67 forbids.  ``None`` is the system default.
+    #: would make the app open a *different* speaker after a reboot, exactly
+    #: the unconfirmed switch F-67 forbids -- and not a bare device name
+    #: either, because ``devices.resolve`` matches this string against
+    #: ``OutputDevice.key`` and nothing else: a name alone would match no
+    #: device, and a present speaker would be reported as gone and playback
+    #: paused for good.  ``None`` is the system default.
     output_device: str | None = None
 
     # -- presentation (F-86, 4.1) -----------------------------------------
@@ -266,6 +320,19 @@ class Settings:
     #: that running an older build once does not silently discard the newer
     #: build's settings (N-15).
     extra: Mapping[str, Any] = field(default_factory=dict)
+
+    #: The schema version of the document these values came from.  Equal to
+    #: ``SETTINGS_SCHEMA_VERSION`` for anything this build read or built
+    #: itself; larger only for a file a newer build wrote, which
+    #: ``save_settings`` then refuses to overwrite (N-15).  Carried on the
+    #: value rather than checked at the file, because the refusal has to
+    #: follow the settings through the ``with_`` copies the GUI makes.
+    schema_version: int = SETTINGS_SCHEMA_VERSION
+
+    @property
+    def from_a_newer_version(self) -> bool:
+        """N-15: this document is one this build must not interpret or write."""
+        return self.schema_version > SETTINGS_SCHEMA_VERSION
 
     # -- convenience -------------------------------------------------------
 
@@ -367,7 +434,11 @@ class Settings:
 
     def to_dict(self) -> dict[str, Any]:
         known: dict[str, Any] = {
-            "version": SETTINGS_SCHEMA_VERSION,
+            # The document's own version, not this build's: a newer marker is
+            # preserved rather than stamped over.  ``save_settings`` refuses
+            # to write such a document at all (N-15), so the only number that
+            # ever reaches a file from here is one this build can read back.
+            "version": self.schema_version,
             "voice": self.voice.to_dict(),
             "cpu_percent": self.cpu_percent,
             "memory_bytes": self.memory_bytes,
@@ -407,6 +478,35 @@ class Settings:
         """
         problems: list[Problem] = []
         defaults = cls()
+
+        version = _read_version(d.get("version"), problems)
+        if version > SETTINGS_SCHEMA_VERSION:
+            # N-15.  Every key is left unread: this build cannot know which of
+            # the names it recognises still mean what they meant in version 1,
+            # and a value read under the wrong meaning would be applied to a
+            # job and then written back over the newer file.  The unknown keys
+            # are still carried so nothing is lost if the value is ever saved
+            # by a build that does understand them.
+            problems.append(
+                Problem(
+                    code=Code.FILE_UNSUPPORTED,
+                    message=(
+                        "Your settings were saved by a newer version of EchoAct; "
+                        "this version is using its defaults and will not change them."
+                    ),
+                    remedies=(
+                        "Use the newer version to change these settings.",
+                        "Settings changed here cannot be saved until then.",
+                    ),
+                )
+            )
+            return (
+                cls(
+                    schema_version=version,
+                    extra={k: v for k, v in d.items() if k not in _KNOWN_KEYS},
+                ),
+                tuple(problems),
+            )
 
         memory = _read_memory(d.get("memory_bytes"), problems)
 
@@ -557,13 +657,68 @@ def _read_bool(raw: Any, default: bool, name: str, problems: list[Problem]) -> b
     return default
 
 
+def _as_number(raw: int | float) -> float | None:
+    """A JSON number as a float that can be compared, or ``None`` if it cannot.
+
+    JSON as Python parses it is wider than the numbers ``int()`` and
+    ``float()`` accept: ``json.loads`` reads the JavaScript spellings ``NaN``,
+    ``Infinity`` and ``-Infinity`` by default, and an integer literal has no
+    size limit.  ``int(nan)`` raises ``ValueError``; ``int(inf)`` and
+    ``float(10**400)`` raise ``OverflowError``.  Every field reader goes
+    through here first, because load must never raise: F-24's guarantee is
+    that a corrupt settings file costs the user their settings, not their
+    launch, and rule 3 forbids a ``ValueError`` crossing this boundary anyway.
+
+    An infinity keeps its sign, so a range check clamps it to the near end of
+    the range like any other out-of-range number.  ``NaN`` is the one value
+    with no order at all, and gets ``None``: there is no end of the range it
+    is nearer to, so its reader falls back to the field's default instead.
+
+    Going through ``float`` costs nothing here: every range in this module is
+    far below 2**53, so any integer that could be *kept* converts exactly,
+    and one large enough to lose precision is one about to be clamped.
+    """
+    try:
+        value = float(raw)
+    except OverflowError:  # an integer literal with no float to represent it
+        return math.inf if raw > 0 else -math.inf
+    return None if math.isnan(value) else value
+
+
+def _read_version(raw: Any, problems: list[Problem]) -> int:
+    """The document's schema version (N-15).
+
+    An absent or unreadable marker reads as this build's own version: a file
+    with no version at all is one this build wrote before the marker existed,
+    and treating a damaged marker as "from the future" would lock the user
+    out of their own settings over a single bad byte.  A marker that is
+    legibly larger is the case N-15 is about, and is honoured.
+    """
+    if raw is None:
+        return SETTINGS_SCHEMA_VERSION
+    if isinstance(raw, bool) or not isinstance(raw, int | float):
+        problems.append(
+            _problem(Code.FILE_CORRUPT, "The settings file's version marker was unreadable.")
+        )
+        return SETTINGS_SCHEMA_VERSION
+    value = _as_number(raw)
+    if value is None or math.isinf(value):
+        problems.append(
+            _problem(Code.FILE_CORRUPT, "The settings file's version marker was unreadable.")
+        )
+        return SETTINGS_SCHEMA_VERSION
+    return int(value)
+
+
 def _read_memory(raw: Any, problems: list[Problem]) -> int | None:
     """``None`` is not a missing value here but F-21's automatic default, so an
     unreadable one returns to automatic rather than to the 2 GiB floor -- the
     floor is what F-23 refuses below, not what a user meant to ask for."""
     if raw is None:
         return None
-    if isinstance(raw, bool) or not isinstance(raw, int | float):
+    # ``NaN`` is literally not a number, so it takes this branch rather than
+    # the clamp below: there is no size it is closest to.
+    if isinstance(raw, bool) or not isinstance(raw, int | float) or _as_number(raw) is None:
         problems.append(
             _problem(
                 Code.FILE_CORRUPT,
@@ -591,9 +746,16 @@ def _read_int(
             _problem(Code.FILE_CORRUPT, f"Setting {name!r} was not a number; using {default}.")
         )
         return default
-    value = int(raw)
+    value = _as_number(raw)
+    if value is None:  # NaN: nothing to clamp towards
+        problems.append(
+            _problem(Code.FILE_CORRUPT, f"Setting {name!r} was not a number; using {default}.")
+        )
+        return default
     if value < low or value > high:
-        clamped = max(low, min(high, value))
+        # Clamped from the bound, not from ``value``: an infinity has no
+        # ``int()``, and the bound is the answer either way.
+        clamped = low if value < low else high
         problems.append(
             _problem(
                 Code.FILE_CORRUPT,
@@ -601,7 +763,7 @@ def _read_int(
             )
         )
         return clamped
-    return value
+    return int(value)
 
 
 def _read_float(
@@ -614,9 +776,9 @@ def _read_float(
             _problem(Code.FILE_CORRUPT, f"Setting {name!r} was not a number; using {default}.")
         )
         return default
-    value = float(raw)
-    if value != value or value < low or value > high:  # NaN fails every comparison
-        clamped = default if value != value else max(low, min(high, value))
+    value = _as_number(raw)
+    if value is None or value < low or value > high:  # NaN has no order to clamp
+        clamped = default if value is None else (low if value < low else high)
         problems.append(
             _problem(
                 Code.FILE_CORRUPT,
@@ -754,12 +916,12 @@ def _read_tempo(raw: Any, default: float, problems: list[Problem]) -> float:
     if isinstance(raw, bool) or not isinstance(raw, int | float):
         problems.append(_problem(Code.FILE_CORRUPT, "The saved tempo was not a number; using 1.00x."))
         return default
-    tempo = float(raw)
-    if tempo != tempo:  # NaN
+    tempo = _as_number(raw)
+    if tempo is None:  # NaN
         problems.append(_problem(Code.TEMPO_OUT_OF_RANGE, "The saved tempo was not a number."))
         return TEMPO_DEFAULT
     if not TEMPO_MIN <= tempo <= TEMPO_MAX:
-        clamped = max(TEMPO_MIN, min(TEMPO_MAX, tempo))
+        clamped = TEMPO_MIN if tempo < TEMPO_MIN else TEMPO_MAX
         problems.append(
             _problem(
                 Code.TEMPO_OUT_OF_RANGE,
@@ -784,12 +946,15 @@ def _read_presets(raw: Any, problems: list[Problem]) -> tuple[VoicePreset, ...]:
         if not isinstance(item, Mapping):
             dropped += 1
             continue
-        try:
-            preset = VoicePreset.from_dict(item)
-        except (KeyError, TypeError, ValueError):
+        # The name is settled before the voice is read, so that a duplicate
+        # this loop is about to discard does not report repairs for itself.
+        name = item.get("name")
+        if not isinstance(name, str) or not name or name in seen:
             dropped += 1
             continue
-        if not preset.name or preset.name in seen:
+        try:
+            preset = VoicePreset.from_dict(item, problems)
+        except (KeyError, TypeError, ValueError):
             dropped += 1
             continue
         seen.add(preset.name)
@@ -856,26 +1021,66 @@ def _unreadable(target: Path, what: str) -> Problem:
 def save_settings(settings: Settings, path: Path | None = None) -> None:
     """Write the settings file so that a crash cannot corrupt it (N-14).
 
-    Temp file in the same directory, flush, ``fsync``, then ``os.replace``.
-    The rename is atomic on both supported platforms, so a reader sees either
-    the whole old file or the whole new one.  Writing in place would leave a
-    truncated file if the process died between the truncate and the write, and
-    N-14 requires previously sound data to survive a save that fails midway.
+    A temp file of its own in the same directory, flush, ``fsync``, then
+    ``os.replace``.  The rename is atomic on both supported platforms, so a
+    reader sees either the whole old file or the whole new one.  Writing in
+    place would leave a truncated file if the process died between the
+    truncate and the write, and N-14 requires previously sound data to survive
+    a save that fails midway.
+
+    The temp name comes from ``mkstemp`` rather than from the process id: two
+    saves at once in one process would otherwise share a single temp file,
+    interleave their payloads in it, and race their renames -- landing one
+    save's content while telling the *other* caller it succeeded.  Lost data
+    reported as a success is precisely what N-14 forbids.  ``SettingsStore``
+    serialises its own saves on top of this; a unique temp file is what makes
+    two unserialised ones merely ordered rather than corrupting.
     """
+    if settings.from_a_newer_version:
+        raise EchoActError(
+            Code.FILE_UNSUPPORTED,
+            "These settings were saved by a newer version of EchoAct and were not changed.",
+            detail={
+                "file_version": settings.schema_version,
+                "this_version": SETTINGS_SCHEMA_VERSION,
+            },
+        )
     target = path or settings_path()
-    payload = json.dumps(settings.to_dict(), ensure_ascii=False, indent=2, sort_keys=True) + "\n"
-    tmp = target.with_name(f"{target.name}.{os.getpid()}.tmp")
+    try:
+        # ``allow_nan`` off: ``json.dumps`` would happily write the JavaScript
+        # spellings ``NaN`` and ``Infinity``, which are legal for the parser
+        # to read back but are not a CPU percentage or a byte count.  Refusing
+        # here keeps the last sound file in place instead of writing one this
+        # app could only ever repair, and turns a caller's bad value into the
+        # one exception type rule 3 allows out of a module.
+        payload = (
+            json.dumps(
+                settings.to_dict(), ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False
+            )
+            + "\n"
+        )
+    except (ValueError, TypeError) as exc:
+        raise EchoActError(
+            Code.INTERNAL,
+            "The settings could not be saved; your previous settings are unchanged.",
+            cause=exc,
+        ) from exc
+
+    tmp: Path | None = None
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
-        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+        handle, name = tempfile.mkstemp(dir=target.parent, prefix=f"{target.name}.", suffix=".tmp")
+        tmp = Path(name)
+        with open(handle, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(payload)
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, target)
         _fsync_dir(target.parent)
     except OSError as exc:
-        with suppress(OSError):
-            tmp.unlink()
+        if tmp is not None:
+            with suppress(OSError):
+                tmp.unlink()
         raise EchoActError(
             _save_failure_code(exc),
             "The settings could not be saved; your previous settings are unchanged.",
@@ -916,6 +1121,14 @@ class SettingsStore:
     leaves the in-memory state matching what is actually on disk: N-14's
     "previously sound data is preserved" is only true if the app agrees with
     the file about which version survived.
+
+    One lock covers reading, writing, and the read-modify-write in
+    ``update``.  The GUI, the REST service and the MCP server all change
+    settings, on three different threads; without it two ``update`` calls both
+    read the same starting value and the second silently drops the first
+    caller's change, while the store's in-memory value ends up describing
+    whichever save happened to rename last rather than what the file holds.
+    It is an ``RLock`` because ``current`` may load inside a held lock.
     """
 
     def __init__(self, path: Path | None = None) -> None:
@@ -923,6 +1136,7 @@ class SettingsStore:
         self._settings = Settings()
         self._problems: tuple[Problem, ...] = ()
         self._loaded = False
+        self._lock = threading.RLock()
 
     @property
     def path(self) -> Path:
@@ -931,28 +1145,86 @@ class SettingsStore:
     @property
     def problems(self) -> tuple[Problem, ...]:
         """Whatever the last load had to repair.  F-25 reports these once."""
-        return self._problems
+        with self._lock:
+            return self._problems
 
     @property
     def current(self) -> Settings:
-        if not self._loaded:
-            self.load()
-        return self._settings
+        with self._lock:
+            if not self._loaded:
+                self.load()
+            return self._settings
 
     def load(self) -> Settings:
-        self._settings, self._problems = load_settings(self._path)
-        self._loaded = True
-        return self._settings
+        with self._lock:
+            self._settings, self._problems = load_settings(self._path)
+            self._loaded = True
+            return self._settings
 
     def save(self, settings: Settings) -> None:
-        save_settings(settings, self._path)
-        self._settings = settings
-        self._loaded = True
+        with self._lock:
+            save_settings(settings, self._path)
+            self._settings = settings
+            self._loaded = True
 
     def update(self, **kw: Any) -> Settings:
-        updated = self.current.with_(**kw)
-        self.save(updated)
-        return updated
+        with self._lock:
+            updated = self.current.with_(**kw)
+            self.save(updated)
+            return updated
+
+    def mutate(self, change: Callable[[Settings], Settings]) -> Settings:
+        """Save a change computed from the current value, atomically.
+
+        ``update`` covers "set these fields"; this covers the changes that
+        have to see the old value to work out the new one -- adding a preset,
+        recording a licence acceptance -- which is exactly where a read and a
+        separate write let a concurrent save in between and lose one of them.
+        """
+        with self._lock:
+            updated = change(self.current)
+            self.save(updated)
+            return updated
+
+
+class SettingsModelPreferences:
+    """``echoact.models.registry.ModelPreferences``, backed by the settings file.
+
+    N-11 puts licence acceptance in settings and 5.3 puts the download
+    pre-authorisation there too, so both belong in the one file this module
+    owns -- ``registry.JsonModelPreferences`` says as much and exists only
+    until there is something here to hand it.  This is that thing: wire it
+    into ``ModelRegistry(preferences=SettingsModelPreferences(store))`` and
+    the owner's two decisions have a single home, one that N-14's atomic save
+    and N-15's version check already protect.  Two homes would be worse than
+    either: the F-80 policy screen reads settings, the registry reads its own
+    file, and each would report a licence the other had never seen.
+
+    The protocol's spellings are kept exactly -- ``license_accepted`` and its
+    ``fingerprint``, both American, both the registry's -- because a protocol
+    is only satisfied by the caller's names.  The translation to this
+    module's ``licence`` and to a new frozen ``Settings`` happens here, where
+    it is one adapter rather than a rule every caller has to remember.
+    """
+
+    def __init__(self, store: SettingsStore | None = None) -> None:
+        self._store = store if store is not None else SettingsStore()
+
+    @property
+    def store(self) -> SettingsStore:
+        return self._store
+
+    def license_accepted(self, model_id: str, fingerprint: str) -> bool:
+        return self._store.current.licence_accepted(model_id, fingerprint)
+
+    def record_license_acceptance(self, model_id: str, fingerprint: str) -> None:
+        self._store.mutate(lambda s: s.accept_licence(model_id, fingerprint))
+
+    def download_authorised(self, model_id: str) -> bool:
+        return self._store.current.may_download(model_id)
+
+    def set_download_authorised(self, model_id: str, allowed: bool) -> None:
+        self._store.mutate(lambda s: s.authorise_download(model_id, allowed))
 
 
 __all__ = [
@@ -962,9 +1234,11 @@ __all__ = [
     "DisplayLanguage",
     "ResourcePolicyView",
     "Settings",
+    "SettingsModelPreferences",
     "SettingsStore",
     "VoicePreset",
     "load_settings",
     "os_display_language",
+    "output_device_key",
     "save_settings",
 ]

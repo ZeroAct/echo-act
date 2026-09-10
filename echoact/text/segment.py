@@ -315,6 +315,12 @@ def _cut(
     hard_end = min(length, start + SEGMENT_MAX_CODEPOINTS, max(seconds_end, start + 1))
     hard_end = max(hard_end, min(length, start + SEGMENT_MIN_CODEPOINTS))
 
+    # Order of preference: a clause boundary that also leaves a long enough
+    # tail, then a clause boundary that does not, then -- only if the
+    # sentence offers no clause boundary at all -- the gap between two words.
+    # F-81 asks for both the clause rule and the 20-code-point minimum; where
+    # they conflict, a short tail is a worse pause and a mid-clause cut is a
+    # worse sentence.
     for ranks in (_CLAUSE_RANKS, (_RANK_WORD,)):
         for require_tail in (True, False):
             chosen = _best_offset(

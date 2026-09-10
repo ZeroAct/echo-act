@@ -74,10 +74,14 @@ LOAD_TIMEOUT_S: Final = BOUNDED_WAIT_CEILING_S
 SYNTHESIZE_TIMEOUT_S: Final = BOUNDED_WAIT_CEILING_S
 PING_TIMEOUT_S: Final = BOUNDED_WAIT_DEFAULT_S
 
-#: F-87's allow-list, as the supervisor's default.  The check that matters
-#: happens inside the worker, against the session it actually constructed --
-#: this is only what the parent asks for, and a caller with a different
-#: policy passes its own.
+#: F-87's allow-list, as the supervisor's default.  It mirrors
+#: ``echoact.engine.runtime.ALLOWED_PROVIDERS``, which is the authority,
+#: rather than importing it: that module imports onnxruntime at load, and
+#: pulling the inference runtime into the parent process would put tens of
+#: megabytes into exactly the total N-21 asks us to keep apart from the
+#: generation job.  A test asserts the two agree.  The check that matters is
+#: in the worker anyway, against the session it actually constructed; this
+#: is only what the parent asks for.
 DEFAULT_ALLOWED_PROVIDERS: Final = ("CPUExecutionProvider",)
 
 #: A worker error message is quoted back to the user but never logged and
@@ -521,7 +525,7 @@ class WorkerSupervisor:
 
         if proc is not None and proc.poll() is None and stdin is not None:
             try:
-                protocol.write_message(stdin, protocol.Shutdown(seq=self._counter.next()))
+                protocol.write_message(stdin, protocol.Shutdown(seq=self._next_seq()))
             except (OSError, ValueError):
                 pass
         self._close_stream(stdin)
@@ -551,7 +555,7 @@ class WorkerSupervisor:
         # blocked read is how a teardown turns into a hang.
         reader = self._reader
         if reader is not None and reader is not threading.current_thread():
-            reader.join(timeout=remaining())
+            reader.join(timeout=remaining(reserve=0.25))
         stderr_reader = self._stderr_reader
         if stderr_reader is not None and stderr_reader is not threading.current_thread():
             stderr_reader.join(timeout=min(0.5, remaining()))
@@ -682,18 +686,22 @@ class WorkerSupervisor:
         env.update(self._env_overrides)
         return env
 
+    def _next_seq(self) -> int:
+        """Under the state lock: a repeated seq would let one reply match two
+        requests, which is the one thing the drop rule cannot survive."""
+        with self._state_lock:
+            return self._counter.next()
+
     def _send_unload(self) -> None:
         stdin = self._stdin
         if stdin is None:
             return
         try:
-            protocol.write_message(stdin, protocol.Unload(seq=self._counter.next()))
+            protocol.write_message(stdin, protocol.Unload(seq=self._next_seq()))
         except (OSError, ValueError):
             pass
 
     def _call(self, msg: Any, *, timeout: float, kill_on_timeout: bool) -> Any:
-        seq = self._counter.next()
-        msg.seq = seq
         waiter = _Waiter()
         with self._state_lock:
             if self._state is WorkerState.LOST:
@@ -702,6 +710,8 @@ class WorkerSupervisor:
                 raise EchoActError(
                     Code.WORKER_LOST, "The synthesis worker is not running."
                 )
+            seq = self._counter.next()
+            msg.seq = seq
             self._pending[seq] = waiter
             stdin = self._stdin
 

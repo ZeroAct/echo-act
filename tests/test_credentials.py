@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import threading
+from pathlib import Path
 
 import pytest
 
@@ -355,6 +357,140 @@ def test_a_damaged_store_is_reported_rather_than_replaced(store):
         CredentialStore.load()
     assert caught.value.code is Code.INTERNAL
     assert credentials_path().read_text(encoding="utf-8") == "{ not json"
+
+
+_RECORD = (
+    '{"ref": "a", "client_id": "cli_1", "name": "n", "capabilities": [], '
+    '"created_at": 0, "expires_at": 1, "verifier": %s}'
+)
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "[]",  # a JSON array where the document should be
+        "5",
+        '"hello"',
+        "null",
+        '{"schema": 1, "credentials": {}}',
+        '{"schema": 1, "credentials": [[]]}',
+        '{"schema": 1, "credentials": [' + _RECORD % "[]" + "]}",
+    ],
+)
+def test_every_damaged_store_shape_reports_the_same_way(store, damage):
+    """Not only the one shape ``json.loads`` complains about.
+
+    ``load`` runs at launch, and 5.3 wants a broken store to leave the GUI,
+    generation, and playback usable.  A caller marking the integrations
+    unavailable catches EchoActError, so anything that escapes as a bare
+    AttributeError or TypeError takes the app down with it.
+    """
+    _client(store, name="Alpha")
+    credentials_path().write_text(damage, encoding="utf-8")
+    with pytest.raises(EchoActError) as caught:
+        CredentialStore.load()
+    assert caught.value.code is Code.INTERNAL
+    assert credentials_path().read_text(encoding="utf-8") == damage
+
+
+def test_a_store_file_that_is_not_utf8_is_reported_rather_than_raised_raw(store):
+    _client(store, name="Alpha")
+    # A UTF-16 BOM in front of otherwise sound JSON: what an editor that
+    # "helpfully" re-saved the file leaves behind.
+    credentials_path().write_bytes(bytes([0xFF, 0xFE]) + b'{"schema": 1}')
+    with pytest.raises(EchoActError) as caught:
+        CredentialStore.load()
+    assert caught.value.code is Code.INTERNAL
+
+
+@pytest.fixture
+def unwritable(tmp_path):
+    """A store holding one client whose every save from now on will fail.
+
+    5.3's "database unavailable, locked, or storage full", arranged the one
+    way that behaves the same on both supported platforms: the directory the
+    file lives in is replaced by a regular file, so the save fails before it
+    writes anything and the previously sound file stays where it was.
+    """
+    root = tmp_path / "sub"
+    root.mkdir()
+    store = CredentialStore(root / "credentials.json")
+    issued = store.issue("Alpha", frozenset({Capability.GENERATE}), days=90, now=T0)
+    saved = (root / "credentials.json").read_text(encoding="utf-8")
+    (root / "credentials.json").unlink()
+    root.rmdir()
+    root.write_text("this is not a directory", encoding="utf-8")
+    return store, issued, saved
+
+
+def test_a_store_it_cannot_write_does_not_fail_an_authenticated_request(unwritable):
+    store, issued, _ = unwritable
+    cred = store.authenticate(issued.token, now=T0 + 5.0)
+
+    assert cred.client_id == issued.client_id, "a valid credential is still valid"
+    assert cred.last_access_at is None, "rolled back: the file still says None"
+    reported = store.write_error
+    assert reported is not None, "5.3: the save failure is reported, not hidden"
+    assert reported.retry_after_s is None
+
+
+def test_a_revocation_that_cannot_be_persisted_does_not_half_happen(unwritable):
+    store, issued, _ = unwritable
+    with pytest.raises(EchoActError):
+        store.revoke(issued.ref, now=T0 + 1.0)
+
+    # The caller was told the revocation failed, so it has no client id to
+    # cancel jobs with (5.3, F-52).  A revocation applied here anyway would be
+    # one nothing cancels jobs for and one the next launch undoes.
+    assert store.get(issued.ref).revoked_at is None
+    assert store.authenticate(issued.token, now=T0 + 2.0).client_id == issued.client_id
+
+
+def test_no_mutation_survives_a_save_that_failed(unwritable):
+    store, issued, saved = unwritable
+    before = store.export_public(now=T0)
+
+    for operation in (
+        lambda: store.issue("Beta", frozenset({Capability.GENERATE}), now=T0),
+        lambda: store.reissue(issued.ref, now=T0),
+        lambda: store.set_capabilities(issued.ref, frozenset()),
+        lambda: store.revoke(issued.ref, now=T0),
+        lambda: store.forget(issued.ref),
+    ):
+        with pytest.raises(EchoActError):
+            operation()
+
+    assert store.export_public(now=T0) == before
+    assert len(store) == 1
+    assert store.authenticate(issued.token, now=T0).ref == issued.ref
+    assert saved  # the file that was written before the failures is intact
+
+
+def test_a_full_disk_is_reported_as_a_full_disk(store):
+    """F-57: the code has to name the cause the owner can act on.
+
+    STORAGE_FULL is not retryable and so carries no hint (rule 8): the same
+    request cannot succeed until the user frees space.
+    """
+    issued = _client(store)
+    original = Path.write_text
+
+    def no_space(self, *args, **kwargs):
+        if self.name.startswith("credentials.json"):
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return original(self, *args, **kwargs)
+
+    Path.write_text = no_space
+    try:
+        with pytest.raises(EchoActError) as caught:
+            store.revoke(issued.ref, now=T0)
+    finally:
+        Path.write_text = original
+
+    assert caught.value.code is Code.STORAGE_FULL
+    assert caught.value.retryable is False
+    assert caught.value.retry_after_s is None
+    assert store.get(issued.ref).revoked_at is None
 
 
 def test_authentication_is_thread_safe(store):

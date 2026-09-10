@@ -26,12 +26,15 @@ and keeps the GUI able to preview a revocation's consequences.
 from __future__ import annotations
 
 import base64
+import errno
 import hmac
 import json
 import os
 import re
 import secrets
 import threading
+from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from enum import StrEnum
 from hashlib import scrypt
@@ -112,6 +115,20 @@ def _b64d(text: str) -> bytes:
     return base64.urlsafe_b64decode(text.encode("ascii"))
 
 
+def _as_object(value: Any, what: str) -> dict[str, Any]:
+    """Insist a value decoded from the store file is a JSON object.
+
+    Every ``from_record`` below indexes what it is given.  A file holding
+    ``[]``, ``5``, or ``null`` where an object belongs would otherwise reach
+    ``.get`` and leave the module as a bare ``AttributeError``, which is the
+    one thing CLAUDE.md rule 3 forbids.  ``ValueError`` is what the callers
+    already treat as "the file is damaged".
+    """
+    if not isinstance(value, dict):
+        raise ValueError(f"{what} is {type(value).__name__}, not an object")
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class Verifier:
     """What replaces the credential in storage (F-71, N-17).
@@ -161,6 +178,7 @@ class Verifier:
 
     @classmethod
     def from_record(cls, d: dict[str, Any]) -> Verifier:
+        d = _as_object(d, "verifier")
         if d.get("algorithm") != "scrypt":
             raise ValueError(f"unsupported verifier algorithm {d.get('algorithm')!r}")
         n, r, p = int(d["n"]), int(d["r"]), int(d["p"])
@@ -281,6 +299,7 @@ class Credential:
 
     @classmethod
     def from_record(cls, d: dict[str, Any]) -> Credential:
+        d = _as_object(d, "credential record")
         return cls(
             ref=str(d["ref"]),
             client_id=str(d["client_id"]),
@@ -437,6 +456,7 @@ class CredentialStore:
         self._path = path if path is not None else credentials_path()
         self._lock = threading.RLock()
         self._by_ref: dict[str, Credential] = {}
+        self._write_error: EchoActError | None = None
         # An unknown reference must cost what a known one costs.  Without this
         # decoy, response time answers "does this client exist?" for free.
         self._decoy = Verifier.for_token(
@@ -454,10 +474,20 @@ class CredentialStore:
         the top on the next call and silently revoke every client the user had
         registered; F-79's answer -- report the integration unavailable and
         keep the rest of the app working -- is the better failure.
+
+        That answer only holds if *every* damaged shape arrives as an
+        ``EchoActError``.  A file is read as bytes and decoded inside the
+        parse guard on purpose: ``UnicodeDecodeError`` is a ``ValueError``,
+        never an ``OSError``, so decoding in the read guard would let a file
+        of arbitrary bytes -- a truncated write, a UTF-16 editor -- escape as
+        a raw builtin.  The shape of the decoded document is checked for the
+        same reason: this runs at launch, and a caller that catches
+        ``EchoActError`` to mark the integrations unavailable (5.3) must not
+        be bypassed by whatever happens to be in the file.
         """
         store = cls(path)
         try:
-            raw = store._path.read_text(encoding="utf-8")
+            raw = store._path.read_bytes()
         except FileNotFoundError:
             return store
         except OSError as exc:
@@ -465,13 +495,21 @@ class CredentialStore:
                 Code.INTERNAL, "The credential store could not be read.", cause=exc
             ) from exc
         try:
-            doc = json.loads(raw)
+            doc = _as_object(json.loads(raw.decode("utf-8")), "credential store")
             if int(doc.get("schema", 0)) != _SCHEMA_VERSION:
                 raise ValueError(f"unsupported credential schema {doc.get('schema')!r}")
-            for record in doc["credentials"]:
+            records = doc["credentials"]
+            if not isinstance(records, list):
+                raise ValueError(f"credentials is {type(records).__name__}, not a list")
+            for record in records:
                 cred = Credential.from_record(record)
                 store._by_ref[cred.ref] = cred
-        except (ValueError, KeyError, TypeError) as exc:
+        except (ValueError, KeyError, TypeError, AttributeError) as exc:
+            # AttributeError is a backstop, not the plan: the shape checks
+            # above are what keep it from arising.  It is caught anyway
+            # because rule 3 is about what leaves the module, and a store file
+            # is untrusted input in the sense that matters here -- nothing in
+            # the app wrote the bytes that are actually there.
             raise EchoActError(
                 Code.INTERNAL, "The credential store is damaged.", cause=exc
             ) from exc
@@ -556,7 +594,11 @@ class CredentialStore:
                 verifier=Verifier.for_token(token),
             )
             self._by_ref[ref] = cred
-            self._save_locked()
+
+            def _undo() -> None:
+                del self._by_ref[ref]
+
+            self._save_or_undo_locked(_undo)
         return IssuedCredential(credential=cred, token=token)
 
     def ensure_owner_credential(
@@ -604,9 +646,18 @@ class CredentialStore:
                 raise EchoActError(Code.CREDENTIAL_REVOKED, detail={"ref": ref})
             lifetime = _validate_days(days) if days is not None else CREDENTIAL_DAYS_DEFAULT
             token = f"{TOKEN_PREFIX}_{ref}_{secrets.token_urlsafe(TOKEN_SECRET_BYTES)}"
+            was_verifier, was_expiry = cred.verifier, cred.expires_at
             cred.verifier = Verifier.for_token(token)
             cred.expires_at = at + lifetime * DAY_S
-            self._save_locked()
+
+            def _undo() -> None:
+                # The old token has to keep working if the new one was never
+                # written down: otherwise a failed save silently locks the
+                # client out until someone reissues again.
+                cred.verifier = was_verifier
+                cred.expires_at = was_expiry
+
+            self._save_or_undo_locked(_undo)
         return IssuedCredential(credential=cred, token=token)
 
     # -- changing -------------------------------------------------------
@@ -626,7 +677,11 @@ class CredentialStore:
             cred = self.get(ref)
             before = cred.capabilities
             cred.capabilities = after
-            self._save_locked()
+
+            def _undo() -> None:
+                cred.capabilities = before
+
+            self._save_or_undo_locked(_undo)
         return PermissionChange(client_id=cred.client_id, before=before, after=after)
 
     def revoke(self, ref: str, *, now: float | None = None) -> str:
@@ -638,13 +693,24 @@ class CredentialStore:
         the one fact the engine needs.  Revoking twice returns the same id and
         changes nothing further (F-49's "repeated cancellation adds no side
         effects", applied to permissions).
+
+        Either the revocation is persisted and the client id comes back, or it
+        raises and nothing happened.  There is no third outcome: a revocation
+        kept only in memory would return no client id for the caller to cancel
+        jobs with, and would come back to life at the next launch -- the owner
+        would have been told the revocation failed while this process quietly
+        enforced it, which is the worst of both answers.
         """
         at = now if now is not None else wall_now()
         with self._lock:
             cred = self.get(ref)
             if cred.revoked_at is None:
                 cred.revoked_at = at
-                self._save_locked()
+
+                def _undo() -> None:
+                    cred.revoked_at = None
+
+                self._save_or_undo_locked(_undo)
             return cred.client_id
 
     def forget(self, ref: str) -> str:
@@ -657,7 +723,13 @@ class CredentialStore:
         with self._lock:
             cred = self.get(ref)
             del self._by_ref[ref]
-            self._save_locked()
+
+            def _undo() -> None:
+                # The file still holds the entry, so dropping it from memory
+                # only invents a disagreement that the next launch undoes.
+                self._by_ref[ref] = cred
+
+            self._save_or_undo_locked(_undo)
             return cred.client_id
 
     # -- authenticating -------------------------------------------------
@@ -671,6 +743,14 @@ class CredentialStore:
         which clients exist.  Only once the secret matches does the caller
         learn that the credential is expired or revoked -- learning that is
         harmless, since it required holding the credential.
+
+        Recording the access is best effort.  ``last_access_at`` is something
+        F-71's screen displays, not something the decision depends on, and a
+        store that cannot be written is not a reason to turn every
+        authenticated request -- a status poll included -- into a 500 the
+        caller is told not to retry.  The failure is kept in
+        :attr:`write_error` for the app to report (F-79, 5.3) and the
+        timestamp is rolled back, so memory still says what the file says.
         """
         at = now if now is not None else wall_now()
         parsed = _parse_token(token)
@@ -693,8 +773,12 @@ class CredentialStore:
                 raise EchoActError(Code.CREDENTIAL_REVOKED, detail={"ref": current.ref})
             if status is CredentialStatus.EXPIRED:
                 raise EchoActError(Code.CREDENTIAL_EXPIRED, detail={"ref": current.ref})
+            was_access = current.last_access_at
             current.last_access_at = at
-            self._save_locked()
+            try:
+                self._save_locked()
+            except EchoActError:
+                current.last_access_at = was_access
             return current
 
     def authorise(
@@ -722,9 +806,38 @@ class CredentialStore:
 
     # -- persistence ----------------------------------------------------
 
+    @property
+    def write_error(self) -> EchoActError | None:
+        """The last save failure, or None if the store is writable.
+
+        Only :meth:`authenticate` declines to raise one, and 5.3 still wants
+        the save failure *reported*: this is where F-69's service screen and
+        F-79's "integrations unavailable" notice read it from.  Cleared by the
+        next save that works, so it describes the store now rather than
+        whatever went wrong once.
+        """
+        with self._lock:
+            return self._write_error
+
     def save(self) -> None:
         with self._lock:
             self._save_locked()
+
+    def _save_or_undo_locked(self, undo: Callable[[], None]) -> None:
+        """Persist a change, or put memory back as it was and raise.
+
+        5.3 requires a failed save to preserve previously sound data, and in
+        a store that hands out live ``Credential`` objects that has to include
+        the objects themselves.  Mutating first and saving after is fine; what
+        is not fine is keeping the mutation once the caller has been told the
+        operation failed, because this process would then enforce a rule that
+        is in no file and that the next launch will not reproduce.
+        """
+        try:
+            self._save_locked()
+        except EchoActError:
+            undo()
+            raise
 
     def _save_locked(self) -> None:
         doc = {
@@ -743,10 +856,19 @@ class CredentialStore:
                 pass
             os.replace(tmp, self._path)
         except OSError as exc:
-            tmp.unlink(missing_ok=True)
-            raise EchoActError(
-                Code.INTERNAL, "The credential store could not be written.", cause=exc
-            ) from exc
+            with suppress(OSError):
+                # Failing to tidy up must not replace the failure worth
+                # reporting; the temp file is named per process and is
+                # overwritten by the next save either way.
+                tmp.unlink(missing_ok=True)
+            self._write_error = EchoActError(
+                _write_failure_code(exc),
+                "The credential store could not be written; the stored "
+                "credentials are unchanged.",
+                cause=exc,
+            )
+            raise self._write_error from exc
+        self._write_error = None
 
     def _unique_ref(self, name: str) -> str:
         base = _slug(name)
@@ -754,6 +876,23 @@ class CredentialStore:
             ref = f"{base}-{secrets.token_hex(3)}"
             if ref not in self._by_ref:
                 return ref
+
+
+def _write_failure_code(exc: OSError) -> Code:
+    """5.3's "report the save failure", as a code rather than a shrug.
+
+    A blanket INTERNAL told the owner only that something broke, when the two
+    causes that actually happen -- a full disk and a data directory that
+    cannot be written -- each have a code that names them and a remedy that
+    follows from it.  None of the three is retryable in F-57's sense: nothing
+    the caller can do to the identical request makes it succeed, so none of
+    them carries a retry-after hint (rule 8).
+    """
+    if exc.errno in {errno.ENOSPC, errno.EDQUOT}:
+        return Code.STORAGE_FULL
+    if exc.errno in {errno.EACCES, errno.EPERM, errno.EROFS}:
+        return Code.FILE_PERMISSION
+    return Code.INTERNAL
 
 
 def _parse_token(token: str) -> tuple[str, str] | None:

@@ -30,7 +30,7 @@ byte-for-byte what the file held.
 from __future__ import annotations
 
 import stat as stat_module
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Final
 
@@ -69,6 +69,10 @@ _REMEDIES_TOO_LONG: Final = (
 _REMEDIES_EMPTY: Final = (
     "Choose a file that contains text.",
     "Or type the text you want spoken directly into EchoAct.",
+)
+_REMEDIES_ENCODING: Final = (
+    "Choose the encoding the file was saved in, then check the preview.",
+    "Or re-save the file as UTF-8 in a text editor and open it again.",
 )
 _REMEDIES_CONFIRM: Final = (
     "Check the preview and confirm that this file really is the text you want read.",
@@ -142,9 +146,19 @@ def inspect_file(path: str | Path) -> Verdict:
 
     The GUI calls this to build F-34's encoding selector and F-35's preview
     before it disturbs the input box, which is how F-36's "if validation
-    fails the existing content is retained" costs nothing to honour.
+    fails the existing content is retained" costs nothing to honour.  That
+    only works if the answer is the whole answer, so the verdict carries
+    F-03's content rules as well as the sniffer's: a file that is blank or
+    over 50,000 code points comes back with a problem here rather than
+    passing inspection and then raising out of ``load_file`` -- which is the
+    replacement of unsaved input that F-36 exists to prevent.
+
+    The cost is decoding the text twice for a file that will be opened
+    anyway.  A GUI that must not lose the user's input pays it once per
+    chosen file, against a 2,000,000-byte ceiling.
     """
-    return _probe(Path(path))[1]
+    data, verdict = _probe(Path(path))
+    return verdict if data is None else _with_content_limits(data, verdict)
 
 
 def inspect_bytes(data: bytes, *, filename: str | None = None) -> Verdict:
@@ -153,7 +167,7 @@ def inspect_bytes(data: bytes, *, filename: str | None = None) -> Verdict:
     request body at the same 2,000,000 bytes."""
     if len(data) > MAX_IMPORT_FILE_BYTES:
         return _too_large_verdict(len(data))
-    return sniff(data, filename=filename)
+    return _with_content_limits(data, sniff(data, filename=filename))
 
 
 def load_file(
@@ -242,6 +256,73 @@ def _problem_error(
             **detail,
         },
     )
+
+
+def _with_content_limits(data: bytes, verdict: Verdict) -> Verdict:
+    """Add F-03's content rules to a verdict the sniffer already settled.
+
+    The sniffer answers "may these bytes be read as text"; F-03 also asks
+    whether the resulting text is empty or past 50,000 code points.  Both
+    have to be in the verdict, because a caller that inspects, shows a
+    preview, gets a yes, and only then discovers the file is too long has
+    already replaced the input F-36 exists to protect.
+
+    Never raises.  An inspection reports; it is ``load_file`` that refuses.
+    A verdict that already carries a problem is returned untouched: the
+    reason a file cannot be read is the first one found, not the last.
+    """
+    if verdict.problem is not None or not verdict.readable_as_text:
+        return verdict
+    if verdict.encoding is None:
+        return verdict
+    try:
+        text = data.decode(verdict.encoding)
+    except (UnicodeDecodeError, LookupError):
+        # The sniffer decided this decodes; if it does not, that is the
+        # encoding problem to report rather than a content one.
+        return replace(
+            verdict,
+            readable_as_text=False,
+            problem=Problem(
+                code=Code.FILE_ENCODING,
+                message="The file could not be read with the encoding that was detected.",
+                remedies=_REMEDIES_ENCODING,
+            ),
+        )
+    if text.startswith("﻿"):
+        text = text[1:]
+    text, _crlf, _cr = normalise_newlines(text)
+
+    if not text.strip():
+        return replace(
+            verdict,
+            readable_as_text=False,
+            problem=Problem(
+                code=Code.INPUT_EMPTY,
+                message="That file contains no text, only blank space.",
+                remedies=_REMEDIES_EMPTY,
+            ),
+            detail={**verdict.detail, "codepoints": len(text)},
+        )
+    if len(text) > MAX_INPUT_CODEPOINTS:
+        return replace(
+            verdict,
+            readable_as_text=False,
+            problem=Problem(
+                code=Code.INPUT_TOO_LONG,
+                message=(
+                    f"That file holds {len(text):,} characters, and the limit is "
+                    f"{MAX_INPUT_CODEPOINTS:,}."
+                ),
+                remedies=_REMEDIES_TOO_LONG,
+            ),
+            detail={
+                **verdict.detail,
+                "codepoints": len(text),
+                "limit_codepoints": MAX_INPUT_CODEPOINTS,
+            },
+        )
+    return replace(verdict, detail={**verdict.detail, "codepoints": len(text)})
 
 
 def _fs_verdict(code: Code, message: str, remedies: tuple[str, ...]) -> Verdict:
@@ -334,9 +415,22 @@ def _normalise_encoding_name(name: str) -> str:
 def _decode_strictly(data: bytes, encoding: str) -> str:
     """Decode or refuse.  There is no third outcome: F-34 forbids handing
     back text repaired with replacement characters, so no lossy decode
-    happens on this path -- only in a preview, which is labelled as one."""
+    happens on this path -- only in a preview, which is labelled as one.
+
+    A U+FEFF at offset zero is dropped whatever codec produced it.  Only the
+    endianness-detecting codecs consume the mark themselves (see
+    ``sniff.bom_encoding``), and the explicit ones -- ``utf-8``,
+    ``utf-16-le``, ``utf-16-be`` -- are exactly what F-34's selector offers
+    the user and what a REST caller passes.  Left in, the mark becomes a
+    zero-width character at offset 0 of the source text: every 4.2 range
+    after it is off by one against what the GUI shows, and the synthesiser
+    is handed a character to speak.  At offset 0 it is a byte-order mark by
+    definition, never content, which is why no table of codec-to-mark is
+    needed here.
+    """
     try:
-        return data.decode(encoding)
+        text = data.decode(encoding)
+        return text[1:] if text.startswith("\ufeff") else text
     except UnicodeDecodeError as exc:
         raise _problem_error(
             Code.FILE_ENCODING,

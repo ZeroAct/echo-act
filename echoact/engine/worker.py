@@ -8,9 +8,11 @@ segment.  Everything below follows from that:
 
 * It holds a model, a voice-style cache, and nothing else.  No database, no
   job record, no file it named itself.  Killing it loses no durable state.
-* Audio goes to the path the *parent* chose, is flushed and closed, and only
-  then reported.  A worker killed mid-write leaves a file the parent already
-  knows how to discard, instead of a half-line on the pipe.
+* Audio goes to the path the *parent* chose, through ``echoact.audio.wav``,
+  which owns F-82's format and publishes by rename.  A worker killed
+  mid-write therefore leaves nothing at that path at all, which is stronger
+  than the protocol's rule that the parent discards a file it was never
+  told about, and means a file found there is always a finished one.
 * ``KeyboardInterrupt`` and ``SystemExit`` are never caught to keep going.
   The parent's escalation from terminate to kill is the mechanism N-22's
   deadline depends on, and a worker that survives it is a defect.
@@ -31,7 +33,8 @@ import logging
 import os
 import sys
 import time
-import wave
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -39,6 +42,7 @@ import numpy as np
 import psutil
 import supertonic
 
+from ..audio import wav
 from ..errors import Code, EchoActError
 from ..paths import redact
 from ..policy import ENGINE_MAX_CHUNK_CODEPOINTS, ENGINE_SILENCE_DURATION_S
@@ -53,10 +57,26 @@ log = get_logger("engine.worker")
 #: pipeline that does not expose all four is refused rather than trusted.
 _SESSION_ATTRS: tuple[str, ...] = ("dp_ort", "text_enc_ort", "vector_est_ort", "vocoder_ort")
 
-#: F-82 fixes the segment format: mono, 16-bit PCM, the model's native rate.
-_CHANNELS = 1
-_SAMPLE_WIDTH_BYTES = 2
-_INT16_FULL_SCALE = 32767.0
+#: How the allow-list reaches session construction.
+#:
+#: F-87 wants the runtime pinned by an explicit allow-list "never by relying
+#: on a default", and ``supertonic.TTS`` takes no provider argument: its
+#: loader reads ``DEFAULT_ONNX_PROVIDERS`` and hands that to every
+#: ``InferenceSession``.  So the allow-list is written onto the two knobs
+#: the loader actually consults -- the module constant, and the environment
+#: variable ``supertonic/config.py`` has a standing TODO to parse -- for the
+#: duration of the construction, and restored afterwards.  Pinning both
+#: costs nothing and means an upgrade that implements that TODO does not
+#: silently move the decision back to the environment we inherited.
+#:
+#: This is not a substitute for :func:`runtime.verify_sessions`: pinning is
+#: what we asked for and ``get_providers()`` is what we got, and F-87 needs
+#: both.  Scoping the pin to the constructor is enough because
+#: :func:`pipeline_sessions` refuses a pipeline that has not built all four
+#: sessions by the time the constructor returns.
+_PROVIDER_ENV_VAR = "SUPERTONIC_ONNX_PROVIDERS"
+_PROVIDER_CONSTANT = "DEFAULT_ONNX_PROVIDERS"
+_PROVIDER_MODULES: tuple[str, ...] = ("loader", "config", "pipeline")
 
 #: The engine's own code for "language unknown"; F-05's automatic mode is
 #: resolved per sentence by the parent, so this is a fallback for a segment
@@ -97,39 +117,69 @@ def pipeline_sessions(tts: Any) -> dict[str, Any]:
     return found
 
 
-def write_segment_wav(path: str | Path, samples: np.ndarray, sample_rate: int) -> int:
-    """Write one segment and return the frame count read back from the file.
+@contextmanager
+def pinned_providers(providers: Sequence[str]) -> Iterator[list[str]]:
+    """Pin the engine's execution providers to ``providers`` while loading.
 
-    F-82's format is written explicitly rather than left to a library
-    default, and the count is read back from the closed file rather than
-    taken from the array: the parent builds the whole job's time table from
-    this number, so it has to describe the bytes that exist, not the bytes
-    intended.
+    Yields the names of the knobs that were actually set, so the caller can
+    log what pinning meant on this build.  A build that exposes none of them
+    is a warning rather than a refusal: the sessions may still come out
+    local, and :func:`runtime.verify_sessions` is what decides that.
     """
-    flat = np.asarray(samples, dtype=np.float32).reshape(-1)
-    pcm = np.round(np.clip(flat, -1.0, 1.0) * _INT16_FULL_SCALE).astype("<i2")
+    wanted = [str(p) for p in providers]
+    restore: list[tuple[Any, Any]] = []
+    applied: list[str] = []
+    for name in _PROVIDER_MODULES:
+        module = getattr(supertonic, name, None)
+        if module is None or not hasattr(module, _PROVIDER_CONSTANT):
+            continue
+        restore.append((module, getattr(module, _PROVIDER_CONSTANT)))
+        setattr(module, _PROVIDER_CONSTANT, list(wanted))
+        applied.append(f"supertonic.{name}.{_PROVIDER_CONSTANT}")
+    # Set unconditionally: the parent copies its whole environment into this
+    # process, so an inherited value must be overwritten rather than merely
+    # left unread by today's engine build.
+    inherited = os.environ.get(_PROVIDER_ENV_VAR)
+    os.environ[_PROVIDER_ENV_VAR] = ",".join(wanted)
+    applied.append(_PROVIDER_ENV_VAR)
+    try:
+        yield applied
+    finally:
+        for module, previous in restore:
+            setattr(module, _PROVIDER_CONSTANT, previous)
+        if inherited is None:
+            os.environ.pop(_PROVIDER_ENV_VAR, None)
+        else:
+            os.environ[_PROVIDER_ENV_VAR] = inherited
 
-    target = Path(path)
-    with open(target, "wb") as raw:
-        with wave.open(raw, "wb") as out:
-            out.setnchannels(_CHANNELS)
-            out.setsampwidth(_SAMPLE_WIDTH_BYTES)
-            out.setframerate(int(sample_rate))
-            out.writeframes(pcm.tobytes())
-        raw.flush()
-        os.fsync(raw.fileno())
 
-    with wave.open(str(target), "rb") as back:
-        if (
-            back.getnchannels() != _CHANNELS
-            or back.getsampwidth() != _SAMPLE_WIDTH_BYTES
-            or back.getframerate() != int(sample_rate)
-        ):
-            raise EchoActError(
-                Code.GENERATION_FAILED,
-                "The segment file was not written in the model's output format.",
-            )
-        return back.getnframes()
+def write_segment_wav(path: str | Path, samples: np.ndarray, sample_rate: int) -> wav.WriteReport:
+    """Write one segment through F-82's writer and read the file back.
+
+    The writing itself belongs to ``echoact.audio.wav``, which owns F-82:
+    it publishes by rename so a killed or failed write leaves no file at the
+    parent's path, refuses non-finite audio instead of casting it to noise,
+    and counts the samples it had to clip.  This function adds only what the
+    worker's own contract needs on top: the frame count is read back from
+    the closed file rather than taken from the array, because the parent
+    builds the whole job's time table from it and it has to describe the
+    bytes that exist, not the bytes intended.
+    """
+    report = wav.write_segment(path, samples, int(sample_rate))
+    info = wav.probe(report.path)
+    wav.require_output_format(info)
+    if info.sample_rate != int(sample_rate) or info.frame_count != report.frame_count:
+        raise EchoActError(
+            Code.GENERATION_FAILED,
+            "The segment file was not written in the model's output format.",
+            detail={
+                "expected_rate": int(sample_rate),
+                "found_rate": info.sample_rate,
+                "expected_frames": report.frame_count,
+                "found_frames": info.frame_count,
+            },
+        )
+    return report
 
 
 class Worker:
@@ -230,22 +280,13 @@ class Worker:
         # F-19: a new model or a new limit replaces whatever is resident.
         self._release()
 
-        overreach = [p for p in msg.allowed_providers if p not in runtime.ALLOWED_PROVIDERS]
-        if overreach:
-            # The allow-list is the product's, not the caller's.  A parent
-            # asking for more than local CPU is refused before any weights
-            # are touched.
-            self.fail(
-                Code.RUNTIME_PROVIDER_REFUSED,
-                "The requested execution providers exceed the local-only allow-list: "
-                + ", ".join(f"{p} ({runtime.provider_kind(p)})" for p in overreach),
-                fatal=True,
-                seq=msg.seq,
-            )
-            return
-
         try:
-            usable = runtime.requested_providers()
+            # The allow-list is the product's, not the caller's: a parent
+            # asking for more than local CPU is refused before any weights
+            # are touched, and one asking for less gets exactly what it
+            # asked for, both here and in the check after construction.
+            allow = runtime.resolve_allow_list(msg.allowed_providers)
+            usable = runtime.requested_providers(allow)
             refused = runtime.refused_providers()
             if refused:
                 log.info("refusing offered execution providers: %s", ", ".join(refused))
@@ -258,17 +299,29 @@ class Worker:
                 intra,
                 inter,
             )
-            tts = supertonic.TTS(
-                model=msg.model_id,
-                model_dir=msg.model_dir,
-                # F-63/F-84: the parent resolved and verified the manifest.
-                # A worker that could download would make N-01's "no
-                # automatic external communication" unprovable from here.
-                auto_download=False,
-                intra_op_num_threads=intra,
-                inter_op_num_threads=inter,
-            )
-            providers = runtime.verify_sessions(pipeline_sessions(tts))
+            with pinned_providers(usable) as pins:
+                if not any(p.endswith(_PROVIDER_CONSTANT) for p in pins):
+                    # The engine no longer exposes the constant its loader
+                    # reads.  Say so: the sessions are about to be built
+                    # from something we did not choose, and only the check
+                    # below stands between that and N-01.
+                    log.warning(
+                        "the engine exposes no %s to pin; relying on verification alone",
+                        _PROVIDER_CONSTANT,
+                    )
+                log.info("pinned execution providers via %s", ", ".join(pins))
+                tts = supertonic.TTS(
+                    model=msg.model_id,
+                    model_dir=msg.model_dir,
+                    # F-63/F-84: the parent resolved and verified the
+                    # manifest.  A worker that could download would make
+                    # N-01's "no automatic external communication"
+                    # unprovable from here.
+                    auto_download=False,
+                    intra_op_num_threads=intra,
+                    inter_op_num_threads=inter,
+                )
+            providers = runtime.verify_sessions(pipeline_sessions(tts), allowed=allow)
             sample_rate = int(tts.sample_rate)
             voices = [str(v) for v in getattr(tts, "voice_style_names", [])]
         except EchoActError as exc:
@@ -403,7 +456,7 @@ class Worker:
             return
 
         try:
-            wav, _engine_duration = self._tts.synthesize(
+            engine_wav, _engine_duration = self._tts.synthesize(
                 msg.text,
                 style,
                 total_steps=msg.total_steps,
@@ -417,9 +470,25 @@ class Worker:
                 lang=engine_lang(msg.lang),
             )
             synth_seconds = time.monotonic() - started
-            samples = np.asarray(wav, dtype=np.float32).reshape(-1)
-            peak = float(np.max(np.abs(samples))) if samples.size else 0.0
-            frame_count = write_segment_wav(msg.out_path, samples, self._sample_rate)
+            samples = np.asarray(engine_wav, dtype=np.float32).reshape(-1)
+            # Peak and clip count come from the writer, which measures the
+            # audio it actually stored.  Non-finite output is refused there
+            # rather than cast to noise, so nothing that cannot be spoken
+            # reaches the file or `peak` on the wire.
+            report = write_segment_wav(msg.out_path, samples, self._sample_rate)
+            frame_count = report.frame_count
+            peak = report.peak
+            if report.clipped:
+                # F-55: a flattened signal is a defect worth a line in the
+                # log even though it is not a failed segment.
+                log.warning(
+                    "segment clipped job=%s index=%d samples=%d of %d peak=%.3f",
+                    msg.job_id,
+                    msg.segment_index,
+                    report.clipped,
+                    frame_count,
+                    peak,
+                )
         except MemoryError:
             # F-23: a job that cannot fit halts, and the parent will kill a
             # worker whose address space is already exhausted.

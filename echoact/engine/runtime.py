@@ -22,6 +22,18 @@ Two decisions are worth stating, because the obvious alternatives are wrong:
   to, or add, a provider that was not requested; the requested list is an
   intention and ``get_providers()`` is the fact.  ``assert_local_only`` reads
   the fact, in the process that holds the session.
+* **Check after, but *pin* before.**  The check is not the whole mechanism.
+  F-87 says the runtime is restricted by an explicit allow-list "never by
+  relying on a default", so ``requested_providers`` exists to be handed to
+  session construction; a build that constructed sessions from someone
+  else's default and then failed the check would be refusing work it could
+  have done locally.  The caller that owns the sessions
+  (``engine.worker``) is responsible for applying the list it verifies.
+
+The allow-list in force can be *narrowed* by a caller -- ``Load`` carries
+one over the wire -- but never widened: ``resolve_allow_list`` intersects a
+request with ``ALLOWED_PROVIDERS`` and refuses anything outside it, and the
+result is what both the pinning and the verification then use.
 
 Thread counts also come from here rather than from the runtime's own
 defaults: F-87 requires them to be derived from F-20's CPU budget, and A.5
@@ -31,7 +43,7 @@ not only a limit but the faster setting.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Final
 
@@ -99,19 +111,56 @@ def refused_providers() -> list[str]:
     return [p for p in available_providers() if p not in ALLOWED_PROVIDERS]
 
 
-def requested_providers() -> list[str]:
+def resolve_allow_list(requested: Iterable[str] | None) -> tuple[str, ...]:
+    """The allow-list in force, given what a caller asked for.
+
+    ``Load.allowed_providers`` crosses a process boundary, so it is a
+    request and not an authority: it can narrow the product's allow-list --
+    a parent that knows it wants only one provider says so and gets exactly
+    that -- and can never widen it.  A request naming nothing we allow is a
+    refusal rather than a silent fall-back to the full list, because a
+    caller that asked for no usable provider must not be given one.
+    """
+    if requested is None:
+        return ALLOWED_PROVIDERS
+    asked = [str(p) for p in requested]
+    overreach = [p for p in asked if p not in ALLOWED_PROVIDERS]
+    if overreach:
+        kinds = ", ".join(f"{p} ({provider_kind(p)})" for p in overreach)
+        raise EchoActError(
+            Code.RUNTIME_PROVIDER_REFUSED,
+            f"The requested execution providers exceed the local-only allow-list: {kinds}",
+            detail={"requested": asked, "refused": overreach, "allowed": list(ALLOWED_PROVIDERS)},
+        )
+    narrowed = tuple(p for p in ALLOWED_PROVIDERS if p in asked)
+    if not narrowed:
+        raise EchoActError(
+            Code.RUNTIME_PROVIDER_REFUSED,
+            "The request names no execution provider to run on.",
+            detail={"requested": asked, "allowed": list(ALLOWED_PROVIDERS)},
+        )
+    return narrowed
+
+
+def requested_providers(allowed: Sequence[str] | None = None) -> list[str]:
     """The provider list to hand to ``InferenceSession``.
+
+    This is the half of F-87 that has to reach session construction: the
+    caller passes this list to whatever builds the sessions, so the
+    providers registered on them are ours by decision rather than the
+    engine's by default.  ``assert_local_only`` then checks the result.
 
     Allow-list order is preserved, because the runtime picks by order and an
     allowed provider must never sit behind one we would refuse.
     """
+    allow = ALLOWED_PROVIDERS if allowed is None else tuple(allowed)
     offered = set(available_providers())
-    usable = [p for p in ALLOWED_PROVIDERS if p in offered]
+    usable = [p for p in allow if p in offered]
     if not usable:
         raise EchoActError(
             Code.RUNTIME_PROVIDER_REFUSED,
             "The inference runtime offers no local CPU execution provider.",
-            detail={"allowed": list(ALLOWED_PROVIDERS), "available": available_providers()},
+            detail={"allowed": list(allow), "available": available_providers()},
         )
     return usable
 
@@ -160,7 +209,12 @@ def session_options(budget: Budget) -> ort.SessionOptions:
     return session_options_for_threads(budget.intra_op_threads, budget.inter_op_threads)
 
 
-def assert_local_only(session: Any, *, component: str = "session") -> list[str]:
+def assert_local_only(
+    session: Any,
+    *,
+    component: str = "session",
+    allowed: Sequence[str] | None = None,
+) -> list[str]:
     """Refuse a session that runs anywhere but the allow-list.
 
     Reads ``get_providers()`` on the constructed session, which is what the
@@ -168,7 +222,13 @@ def assert_local_only(session: Any, *, component: str = "session") -> list[str]:
     only what was asked for.  A session that cannot say -- no method, or an
     empty list -- is refused too, because an unverifiable session is exactly
     the case N-01 cannot afford to wave through.
+
+    ``allowed`` narrows the check to the list actually in force for this
+    load, so a caller that asked for less than the product allows is held to
+    what it asked for.  It can only ever be a subset of
+    ``ALLOWED_PROVIDERS``; ``resolve_allow_list`` is what produces it.
     """
+    allow = ALLOWED_PROVIDERS if allowed is None else tuple(allowed)
     getter = getattr(session, "get_providers", None)
     if not callable(getter):
         raise EchoActError(
@@ -183,7 +243,7 @@ def assert_local_only(session: Any, *, component: str = "session") -> list[str]:
             f"The {component} reports no execution provider.",
             detail={"component": component},
         )
-    refused = [p for p in providers if p not in ALLOWED_PROVIDERS]
+    refused = [p for p in providers if p not in allow]
     if refused:
         kinds = ", ".join(f"{p} ({provider_kind(p)})" for p in refused)
         raise EchoActError(
@@ -192,13 +252,17 @@ def assert_local_only(session: Any, *, component: str = "session") -> list[str]:
             detail={
                 "component": component,
                 "refused": refused,
-                "allowed": list(ALLOWED_PROVIDERS),
+                "allowed": list(allow),
             },
         )
     return providers
 
 
-def verify_sessions(sessions: Mapping[str, Any]) -> list[str]:
+def verify_sessions(
+    sessions: Mapping[str, Any],
+    *,
+    allowed: Sequence[str] | None = None,
+) -> list[str]:
     """Check every session a loaded pipeline holds and report what is in use.
 
     The return value is what F-53 publishes and F-72 exports: the providers
@@ -213,15 +277,22 @@ def verify_sessions(sessions: Mapping[str, Any]) -> list[str]:
         )
     in_use: list[str] = []
     for name, session in sessions.items():
-        for provider in assert_local_only(session, component=name):
+        for provider in assert_local_only(session, component=name, allowed=allowed):
             if provider not in in_use:
                 in_use.append(provider)
     return in_use
 
 
-def providers_in_use(sessions: Iterable[Any]) -> list[str]:
+def providers_in_use(
+    sessions: Iterable[Any],
+    *,
+    allowed: Sequence[str] | None = None,
+) -> list[str]:
     """``verify_sessions`` for a bare sequence, when the caller has no names."""
-    return verify_sessions({f"session[{i}]": s for i, s in enumerate(sessions)})
+    return verify_sessions(
+        {f"session[{i}]": s for i, s in enumerate(sessions)},
+        allowed=allowed,
+    )
 
 
 def runtime_report() -> RuntimeReport:
@@ -245,6 +316,7 @@ __all__ = [
     "providers_in_use",
     "refused_providers",
     "requested_providers",
+    "resolve_allow_list",
     "runtime_report",
     "session_options",
     "session_options_for_threads",

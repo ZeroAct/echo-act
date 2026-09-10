@@ -26,7 +26,11 @@ import echoact
 from echoact import paths
 from echoact.domain import Budget
 from echoact.engine.container import Enforcement, NullContainer, ResourceContainer, make_container
-from echoact.engine.supervisor import WorkerState, WorkerSupervisor
+from echoact.engine.supervisor import (
+    DEFAULT_ALLOWED_PROVIDERS,
+    WorkerState,
+    WorkerSupervisor,
+)
 from echoact.errors import Code, EchoActError
 from echoact.policy import WORKER_RELEASE_DEADLINE_S
 
@@ -299,6 +303,20 @@ def test_a_different_model_is_reloaded_in_the_same_worker(
     requests = _requests(fake_log)
     assert requests.count("load") == 2
     assert "unload" in requests
+
+
+def test_a_model_reprepared_somewhere_else_is_not_answered_from_the_old_weights(
+    supervisors: list[WorkerSupervisor], worker_script: Path, fake_log: Path
+) -> None:
+    """F-17's warm reuse is keyed on the directory too, so a repair or a
+    relocation (F-65) reloads instead of reusing what is in memory."""
+    sup = _supervisor(supervisors, worker_script, fake_log)
+    sup.load("m1", "/models/m1", BUDGET)
+
+    sup.load("m1", "/models/m1-repaired", BUDGET)
+
+    assert _requests(fake_log).count("load") == 2
+    assert (sup.loaded_model.model_dir if sup.loaded_model else "") == "/models/m1-repaired"
 
 
 def test_a_different_budget_replaces_the_worker(
@@ -671,6 +689,23 @@ def test_the_worker_is_not_run_at_all_if_its_container_cannot_be_applied(
         sup.load("m1", "/models/m1", BUDGET)
     assert caught.value.code is Code.INTERNAL
     assert not fake_log.exists(), "the worker got as far as running"
+
+
+def test_the_parents_allow_list_matches_the_runtimes(
+    supervisors: list[WorkerSupervisor], worker_script: Path, fake_log: Path
+) -> None:
+    """F-87 has one allow-list.  The supervisor mirrors it instead of
+    importing it, to keep onnxruntime out of the parent process, so the two
+    copies are checked against each other here."""
+    from echoact.engine.runtime import ALLOWED_PROVIDERS
+
+    assert DEFAULT_ALLOWED_PROVIDERS == ALLOWED_PROVIDERS
+
+    sup = _supervisor(supervisors, worker_script, fake_log)
+    model = sup.load("m1", "/models/m1", BUDGET)
+    # The fake echoes back what it was asked for, which is what the parent
+    # sent on the wire.
+    assert model.providers == ALLOWED_PROVIDERS
 
 
 def test_the_default_command_is_the_worker_module() -> None:

@@ -235,6 +235,39 @@ def test_blocks_stream_the_same_samples_the_whole_read_returns(tmp_path: Path) -
     assert np.array_equal(np.concatenate(blocks), whole)
 
 
+def test_streaming_a_truncated_file_reports_it_instead_of_ending_early(tmp_path: Path) -> None:
+    """N-21 sends every large read here, so it must fail as loudly as read_wav.
+
+    A retained result can be short for reasons this app never sees -- a disk
+    that filled during an earlier write, a half-restored backup, a sync
+    client -- and F-55 forbids streaming one back as the finished result
+    while ``probe`` keeps reporting the header's length.
+    """
+    path = tmp_path / "s.wav"
+    write_tone(path, 5_000)
+    raw = path.read_bytes()
+    path.write_bytes(raw[: len(raw) - 4_000])
+
+    assert wav.probe(path).frame_count == 5_000, "the header still over-declares"
+    with pytest.raises(EchoActError) as caught:
+        list(wav.iter_blocks(path, block_frames=997))
+    assert caught.value.code is Code.FILE_CORRUPT
+    with pytest.raises(EchoActError):
+        wav.read_wav(path)  # the two paths agree about the same file
+
+
+def test_a_reader_that_wants_only_a_prefix_is_not_told_the_file_is_damaged(
+    tmp_path: Path,
+) -> None:
+    """Only an exhausted stream claims the whole file; a prefix asked for less."""
+    path = tmp_path / "s.wav"
+    write_tone(path, 5_000)
+
+    blocks = wav.iter_blocks(path, block_frames=997)
+    assert len(next(blocks)) == 997
+    blocks.close()
+
+
 def test_streaming_a_foreign_file_fails_when_the_stream_is_asked_for(tmp_path: Path) -> None:
     foreign = tmp_path / "stereo.wav"
     with wave.open(str(foreign), "wb") as writer:
@@ -324,6 +357,28 @@ def test_a_damaged_segment_leaves_no_half_written_output(tmp_path: Path) -> None
     with pytest.raises(EchoActError):
         wav.concatenate([good, bad], [0, 0], tmp_path / "full.wav", RATE)
 
+    assert not (tmp_path / "full.wav").exists()
+    assert list(tmp_path.glob("*.part")) == []
+
+
+def test_a_segment_shorter_than_its_header_leaves_no_joined_file(tmp_path: Path) -> None:
+    """The size check has to run on the ``.part``, not on the caller's file.
+
+    Run after the rename, it reports a failure the caller can only pass on
+    while a complete-looking, playable, short WAV sits at the destination --
+    nothing about that file says it is short, which is exactly what F-55
+    forbids and what the rename discipline exists to prevent.
+    """
+    good, short = tmp_path / "1.wav", tmp_path / "2.wav"
+    write_tone(good, 1_000)
+    write_tone(short, 1_000)
+    raw = short.read_bytes()
+    short.write_bytes(raw[: len(raw) - 1_000])  # header still declares 1,000 frames
+
+    with pytest.raises(EchoActError) as caught:
+        wav.concatenate([good, short], [0, 0], tmp_path / "full.wav", RATE)
+
+    assert caught.value.code is Code.FILE_CORRUPT
     assert not (tmp_path / "full.wav").exists()
     assert list(tmp_path.glob("*.part")) == []
 
@@ -561,6 +616,23 @@ def test_exporting_before_anything_is_ready_is_refused(tmp_path: Path) -> None:
 
     assert caught.value.code is Code.SEGMENT_NOT_READY
     assert not (tmp_path / "partial.wav").exists()
+
+
+def test_a_truncated_ready_segment_leaves_nothing_at_the_export_path(tmp_path: Path) -> None:
+    """F-16's export is a file the user chose; a short one must never appear there."""
+    segments = make_job(tmp_path, 3, ready=2)
+    damaged = tmp_path / "seg1.wav"
+    raw = damaged.read_bytes()
+    damaged.write_bytes(raw[: len(raw) - 800])
+
+    with pytest.raises(EchoActError) as caught:
+        wav.export_partial(
+            segments, tmp_path / "partial.wav", sample_rate=RATE, total_codepoints=90
+        )
+
+    assert caught.value.code is Code.FILE_CORRUPT
+    assert not (tmp_path / "partial.wav").exists()
+    assert list(tmp_path.glob("*.part")) == []
 
 
 def test_a_ready_segment_with_spoken_text_but_no_audio_is_a_hard_error(tmp_path: Path) -> None:

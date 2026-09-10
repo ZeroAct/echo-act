@@ -189,7 +189,10 @@ def test_the_chosen_encoding_is_applied_only_when_it_is_given(tmp_path):
     path = write(tmp_path, "story.txt", body.encode("utf-16-le"))
     with pytest.raises(EchoActError) as caught:
         load_file(path)
-    assert caught.value.code is Code.FILE_NOT_TEXT
+    # An encoding problem rather than "not text": the distinction is the
+    # whole of F-34, because it decides whether the user is offered the
+    # encoding selector or told the file cannot be read at all.
+    assert caught.value.code is Code.FILE_ENCODING
 
     loaded = load_file(path, encoding="utf-16-le")
     assert loaded.text == body

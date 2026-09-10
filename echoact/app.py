@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from .audio.player import Player
-from .config.settings import Settings, SettingsStore
+from .config.settings import Settings, SettingsModelPreferences, SettingsStore
 from .db.store import Store
 from .domain import Capability
 from .engine.supervisor import WorkerSupervisor
@@ -86,7 +86,14 @@ class Application:
             audio_root=audio_dir() if data_root is None else data_root / "audio",
             retention_limit_bytes=self.settings.retention_bytes,
         )
-        self.registry = ModelRegistry(MANIFEST)
+        # The owner's two model decisions -- accepted licence and
+        # authorised download -- live in the settings file rather than in a
+        # second file of the registry's own.  Two homes would mean the F-80
+        # policy screen and the registry each reporting a licence the other
+        # had never seen.
+        self.registry = ModelRegistry(
+            MANIFEST, preferences=SettingsModelPreferences(self.settings_store)
+        )
         self.credentials = CredentialStore.load()
         self.limiter = RateLimiter()
         self.supervisor = supervisor or WorkerSupervisor()
@@ -169,6 +176,31 @@ class Application:
         self.engine.apply_settings(self.settings)
         self.store.set_retention_limit(self.settings.retention_bytes)
         return self.settings
+
+    # ------------------------------------------------------------------
+    # Model preparation (F-09, N-11, F-80)
+    # ------------------------------------------------------------------
+
+    def licence_pending(self, model_id: str | None = None) -> str | None:
+        """The model whose terms have not been accepted, if any.
+
+        N-11 makes acceptance a condition of first preparation, so the
+        window asks this before it starts a job rather than letting the
+        engine refuse one and reporting a code.
+        """
+        target = model_id or self.settings.voice.model_id
+        return target if self.registry.license_acceptance_required(target) else None
+
+    def accept_licence(self, model_id: str) -> None:
+        """Record that the owner accepted this model's restrictions.
+
+        Recorded against a fingerprint of the terms themselves, so a
+        release that amends them asks again instead of inheriting consent
+        given to different words.
+        """
+        self.registry.accept_license(model_id)
+        self.settings = self.settings_store.load()
+        self.engine.apply_settings(self.settings)
 
     # ------------------------------------------------------------------
     # The local service (F-46, F-79, N-31)

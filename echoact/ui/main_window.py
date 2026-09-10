@@ -18,6 +18,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QCloseEvent, QKeySequence
 from PySide6.QtWidgets import (
+    QDialog,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -46,6 +47,7 @@ from . import icons
 from .bridge import EngineBridge
 from .controls import TransportBar, VoicePanel, label, tool_button
 from .i18n import add_korean, approximate_duration, count, tr
+from .licence import LicenceDialog
 from .reading import ReadingSurface
 from .theme import METRICS, Mode, Palette
 from .theme import apply as apply_theme
@@ -321,6 +323,8 @@ class MainWindow(QMainWindow):
             self._start()
 
     def _start(self) -> None:
+        if not self._licence_accepted():
+            return
         text = self.reading.source_text()
         settings = self.voice_panel.settings()
         request = JobRequest(
@@ -351,6 +355,23 @@ class MainWindow(QMainWindow):
         self._update_enabled()
         if not created:
             self._set_status(tr("Ready to read"))
+
+    def _licence_accepted(self) -> bool:
+        """N-11 and F-80: the terms are presented before first preparation.
+
+        Asked here rather than left to the engine's refusal, because a code
+        in a notice bar is not "presented as terms the user accepts".
+        Declining is not an error: the user said not now, and the window
+        simply does not start a job.
+        """
+        pending = self.app.licence_pending()
+        if pending is None:
+            return True
+        dialog = LicenceDialog(MANIFEST.get(pending), self.palette_tokens, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return False
+        self.app.accept_licence(pending)
+        return True
 
     def _cancel(self) -> None:
         if not self._job_id:

@@ -26,19 +26,29 @@ from __future__ import annotations
 
 import io
 import re
+import struct
 import unicodedata
 import zipfile
+import zlib
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Final
 
 from ..errors import Code, EchoActError, Problem
 
-#: Bytes the structural checks look at.  Magic numbers sit in the first few
+#: Bytes the *density* checks look at.  Magic numbers sit in the first few
 #: dozen; control-character density is sampled rather than counted over the
 #: whole file, because a file whose first 8 KiB are clean prose is prose and
 #: the cost of deciding then stays flat at the 2,000,000-byte import ceiling.
+#: A NUL byte is not sampled this way -- it is a single decisive byte rather
+#: than a proportion, one that must not reach the source text from anywhere
+#: in the file, and finding one is a memchr over 2,000,000 bytes at worst.
 SNIFF_WINDOW_BYTES: Final = 8192
+
+#: Bytes of a ZIP ``mimetype`` entry that are read to identify the package.
+#: The longest name matched is 33 bytes; the rest of the allowance is for a
+#: trailing newline and for telling one OpenDocument subtype from another.
+MIMETYPE_PROBE_BYTES: Final = 128
 
 #: Code points shown to the user so an encoding can be judged (F-34, F-35).
 PREVIEW_CODEPOINTS: Final = 400
@@ -62,6 +72,38 @@ AUTO_ENCODINGS: Final = ("utf-8", "cp949")
 #: signal that anything went wrong, which is F-34's silent corruption under
 #: another name.
 SELECTABLE_ENCODINGS: Final = ("utf-8", "cp949", "utf-16", "utf-16-le", "utf-16-be")
+
+#: The selector entries whose *valid* text is full of NUL bytes.  A file in
+#: one of them written without a byte-order mark is precisely the case F-34's
+#: override exists for, and it arrives at the NUL rule looking exactly like a
+#: binary file.  These two are therefore tried before that conclusion is
+#: drawn: otherwise the one failure the override was designed for is the one
+#: failure whose verdict never mentions it, and F-37's "correctable error"
+#: carries nothing an automated caller could correct.
+_BOM_LESS_WIDE_ENCODINGS: Final = ("utf-16-le", "utf-16-be")
+
+#: Code-point ranges EchoAct actually reads aloud: F-04's Korean and English,
+#: the punctuation and full-width forms that travel with them, and the Latin
+#: letters of a European name in an otherwise Korean document.
+_APP_SCRIPT_RANGES: Final = (
+    (0x0009, 0x000D),
+    (0x0020, 0x007E),
+    (0x00A0, 0x024F),
+    (0x1100, 0x11FF),
+    (0x2000, 0x206F),
+    (0x3000, 0x303F),
+    (0x3130, 0x318F),
+    (0xAC00, 0xD7A3),
+    (0xFF01, 0xFF60),
+)
+
+#: Share of a decode that must fall in those ranges before the encoding is
+#: offered as a candidate for bytes that otherwise look binary.  Every
+#: even-length byte string decodes as UTF-16 into *something*: twenty-two
+#: bytes of ASCII prose with one NUL in them become eleven CJK ideographs,
+#: which is a reading rather than a file.  Without this the NUL rule would
+#: hand a preview of ideograph soup to every binary file of even length.
+MIN_APP_SCRIPT_RATIO: Final = 0.8
 
 ENCODING_LABELS: Final = {
     "utf-8": "UTF-8",
@@ -348,6 +390,23 @@ def _text_is_control_dense(text: str) -> bool:
     return controls >= MIN_CONTROL_COUNT and controls / len(text) > MAX_CONTROL_RATIO
 
 
+def _in_app_scripts(ch: str) -> bool:
+    point = ord(ch)
+    return any(low <= point <= high for low, high in _APP_SCRIPT_RANGES)
+
+
+def _reads_as_app_script(text: str) -> bool:
+    """Whether a decode produced something EchoAct could plausibly speak.
+
+    Used only to decide whether an encoding is worth *offering* for bytes
+    that otherwise look binary; it never admits text on its own, and a file
+    it rejects can still be opened by naming the encoding explicitly.
+    """
+    if not text:
+        return False
+    return sum(1 for ch in text if _in_app_scripts(ch)) / len(text) >= MIN_APP_SCRIPT_RATIO
+
+
 def _preview_of(text: str) -> str:
     return text[:PREVIEW_CODEPOINTS]
 
@@ -533,15 +592,50 @@ _MIMETYPE_RULES: Final = (
 )
 
 
+#: Everything ``zipfile`` throws at a file that is damaged, hostile, or
+#: merely in a corner of the format this app does not implement.  It is a
+#: named tuple rather than two inline ones because the list is not
+#: guessable: the constructor raises ``NotImplementedError`` for a central
+#: directory whose "version needed to extract" exceeds 63, reading raises
+#: ``zlib.error`` for a damaged deflate stream and ``NotImplementedError``
+#: for a compression method the standard library does not carry, and either
+#: escaping is a raw non-``EchoActError`` out of ``sniff`` -- which CLAUDE.md
+#: rule 3 forbids, and which F-32 needs told apart as FILE_CORRUPT instead.
+#: ``MemoryError`` is deliberately absent: it is not a fact about the file.
+_ZIP_FAILURES: Final = (
+    zipfile.BadZipFile,
+    zipfile.LargeZipFile,
+    NotImplementedError,
+    RuntimeError,
+    zlib.error,
+    struct.error,
+    OSError,
+    ValueError,
+    EOFError,
+    IndexError,
+    KeyError,
+)
+
+
 def _zip_verdict(data: bytes, size: int) -> Verdict:
     """A ZIP container, and which document format it holds.
 
     Section 2.7 lists DOCX, HWPX and EPUB as separate formats and all three
     are ZIP files, so the signature alone cannot tell them apart and the
     entry names have to be read.  Only the central directory and, at most,
-    the tiny ``mimetype`` entry are touched: nothing else is extracted,
-    because Section 2.7 puts decompression out of scope and a file that
-    cannot be read must stay unread.
+    the first ``MIMETYPE_PROBE_BYTES`` of the ``mimetype`` entry are touched:
+    nothing else is extracted, because Section 2.7 puts decompression out of
+    scope and a file that cannot be read must stay unread.
+
+    That entry is read through ``open(...).read(n)`` rather than ``read()``.
+    The difference is not style: ``read()`` decompresses the whole entry
+    before anything can slice it, so a 400 KB file whose ``mimetype`` inflates
+    to 400 MB would allocate all of it inside a sniffer whose input is capped
+    at 2,000,000 bytes -- N-21's "no unbounded in-memory loading" and N-23's
+    "limits actually bound the work" both fail there, and A-05's *safe*
+    rejection becomes an out-of-memory kill.  The bounded form stops the
+    decompressor at the length asked for.  The entry's declared size is not
+    consulted, because it is written by whoever wrote the file.
     """
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as zf:
@@ -551,10 +645,14 @@ def _zip_verdict(data: bytes, size: int) -> Verdict:
             mimetype = b""
             if "mimetype" in names:
                 try:
-                    mimetype = zf.read("mimetype")[:128]
-                except (RuntimeError, zipfile.BadZipFile, OSError, ValueError):
+                    with zf.open("mimetype") as entry:
+                        mimetype = entry.read(MIMETYPE_PROBE_BYTES)
+                except _ZIP_FAILURES:
+                    # A package whose declaration cannot be read is still
+                    # identifiable from its entry names, and one that is not
+                    # is still a ZIP: neither is a reason to raise.
                     mimetype = b""
-    except (zipfile.BadZipFile, OSError, ValueError, EOFError, IndexError):
+    except _ZIP_FAILURES:
         return _problem_verdict(
             FileKind.ARCHIVE,
             Code.FILE_CORRUPT,
@@ -796,6 +894,25 @@ def verdict_for_text(
     "choose CP949" would become a way past F-35's refusal to interpret a
     binary file as text.
     """
+    nul_at = text.find("\x00")
+    if nul_at >= 0:
+        # A single NUL character condemns the whole text, wherever it sits.
+        # The density rule below cannot do this job: 200 NUL bytes in 23,000
+        # code points of prose are 0.9%, far under MAX_CONTROL_RATIO, so a
+        # ratio test accepts them -- and then F-35's "binary is not
+        # force-interpreted as text" has been broken by a file that is
+        # binary only after the first 8 KiB.  Every one of those NULs would
+        # go to the segmenter, to the engine, and into the 4.2 offsets.
+        return _problem_verdict(
+            FileKind.BINARY,
+            Code.FILE_NOT_TEXT,
+            "This file contains binary data rather than text: it holds NUL characters, which "
+            "readable text does not.",
+            _REMEDIES_BINARY,
+            size=byte_size,
+            format_name=encoding,
+            detail={"first_nul_codepoint": nul_at},
+        )
     if _text_is_control_dense(text):
         return _problem_verdict(
             FileKind.BINARY,
@@ -918,13 +1035,40 @@ def sniff(data: bytes, *, filename: str | None = None) -> Verdict:
             text, declared, byte_size=size, filename=filename, confidence=Confidence.CERTAIN
         )
 
-    structural = _detect_binary(data, size)
+    structural = _detect_binary(data, filename, size)
     if structural is not None:
         return structural
     return _sniff_text(data, filename, size)
 
 
-def _detect_binary(data: bytes, size: int) -> Verdict | None:
+def _wide_encoding_candidates(data: bytes) -> tuple[EncodingCandidate, ...]:
+    """The byte-order-mark-less UTF-16 readings that would yield real text.
+
+    Each returned candidate decodes the whole file strictly, has no NUL and
+    no control soup in it, and is written in a script F-04 covers.  Anything
+    weaker would offer a preview of ideograph soup for every binary file of
+    even length; anything stronger would drop the one case F-34's selector
+    exists for back into a bare "not a text file".
+    """
+    found: list[EncodingCandidate] = []
+    for name in _BOM_LESS_WIDE_ENCODINGS:
+        text, _offset, _reason = _try_decode(data, name)
+        if text is None or "\x00" in text or _text_is_control_dense(text):
+            continue
+        if not _reads_as_app_script(text):
+            continue
+        found.append(
+            EncodingCandidate(
+                name=name,
+                label=ENCODING_LABELS.get(name, name.upper()),
+                decodes_cleanly=True,
+                preview=_preview_of(text),
+            )
+        )
+    return tuple(found)
+
+
+def _detect_binary(data: bytes, filename: str | None, size: int) -> Verdict | None:
     """Everything decided by the bytes' shape rather than by decoding them.
 
     Returns ``None`` when the file is still a candidate for being text.
@@ -987,8 +1131,35 @@ def _detect_binary(data: bytes, size: int) -> Verdict | None:
             f"This is a {archive} archive. EchoAct does not unpack archives.",
         )
 
-    window = data[:SNIFF_WINDOW_BYTES]
-    if b"\x00" in window:
+    # The whole file, not the window: a NUL is one decisive byte rather than
+    # a proportion, and one at offset 11,000 puts a NUL character into the
+    # source text just as surely as one at offset 10 (F-35).
+    nul_at = data.find(b"\x00")
+    if nul_at >= 0:
+        candidates = _wide_encoding_candidates(data)
+        if candidates:
+            # F-34: this is the shape a UTF-16 file with no byte-order mark
+            # arrives in, and it is the very case the encoding override was
+            # added for.  Refusing it with the binary remedies would tell
+            # the user to abandon a file that is only one selector click
+            # from readable, and would leave F-37's caller with a payload
+            # naming no correction.
+            return _problem_verdict(
+                FileKind.TEXT,
+                Code.FILE_ENCODING,
+                "This file's NUL bytes fall in the pattern of UTF-16 text saved without a "
+                "byte-order mark, so its encoding cannot be settled from the bytes alone.",
+                _REMEDIES_ENCODING,
+                size=size,
+                format_name="text",
+                candidates=candidates,
+                needs_confirmation=_extension(filename) not in TEXT_EXTENSIONS,
+                preview=candidates[0].preview,
+                detail={
+                    "first_nul_offset": nul_at,
+                    "selectable_encodings": list(SELECTABLE_ENCODINGS),
+                },
+            )
         return _problem_verdict(
             FileKind.BINARY,
             Code.FILE_NOT_TEXT,
@@ -996,8 +1167,9 @@ def _detect_binary(data: bytes, size: int) -> Verdict | None:
             _REMEDIES_BINARY,
             size=size,
             format_name="binary",
-            detail={"first_nul_offset": window.index(b"\x00")},
+            detail={"first_nul_offset": nul_at},
         )
+    window = data[:SNIFF_WINDOW_BYTES]
     if _byte_window_is_control_dense(window):
         return _problem_verdict(
             FileKind.BINARY,
@@ -1013,6 +1185,8 @@ def _detect_binary(data: bytes, size: int) -> Verdict | None:
 __all__ = [
     "AUTO_ENCODINGS",
     "ENCODING_LABELS",
+    "MIMETYPE_PROBE_BYTES",
+    "MIN_APP_SCRIPT_RATIO",
     "PREVIEW_CODEPOINTS",
     "SELECTABLE_ENCODINGS",
     "SNIFF_WINDOW_BYTES",
