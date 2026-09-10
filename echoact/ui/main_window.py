@@ -13,6 +13,7 @@ to remember.
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, Signal
@@ -82,6 +83,11 @@ add_korean(
         "Following paused": "따라가기 일시 중지됨",
         "Open a text file": "텍스트 파일 열기",
         "Activity": "활동",
+        "Storage": "저장 공간",
+        "{n} items cleaned up": "{n}개 항목을 정리했습니다",
+        "Some items could not be deleted": "일부 항목을 삭제하지 못했습니다",
+        "EchoAct cannot check for a newer version in this build.":
+            "이 빌드에서는 새 버전을 확인할 수 없습니다.",
         "Text files (*.txt *.md);;All files (*)": "텍스트 파일 (*.txt *.md);;모든 파일 (*)",
         "Save audio": "오디오 저장",
         "WAV audio (*.wav)": "WAV 오디오 (*.wav)",
@@ -716,11 +722,212 @@ class MainWindow(QMainWindow):
 
         screen = SettingsView(self.palette_tokens, self.app.settings)
         self._connect_settings(screen)
+        self._refresh_settings_screen(screen)
         # Wide enough that the section text and the controls beside it do
         # not need the horizontal scrollbar. N-30 allows scrolling as the
         # fallback; needing it at the default size is still a bad default.
         self._settings_screen = self._open_screen(
             tr("Settings"), screen, width=900, height=780
+        )
+
+    def _refresh_settings_screen(self, screen: QWidget) -> None:
+        """Fill in what the view cannot measure for itself.
+
+        F-78's applied budget comes from the *running job*, not from a
+        fresh resolution: resolving again would show the same number
+        twice and quietly turn the distinction the requirement draws
+        into two views of one value.
+        """
+        job = self.app.engine.current()
+        screen.set_resource_state(
+            job.budget if job is not None else None,
+            job_running=job is not None,
+        )
+        screen.set_credentials(self.app.credentials.list())
+        self._refresh_storage(screen)
+
+    def _refresh_storage(self, screen: QWidget) -> None:
+        """F-73's five figures.
+
+        Off the main thread: it walks the model cache, which is 385 MB of
+        files on an ordinary install and can be far more.
+        """
+        from .settings_view import storage_snapshot
+
+        def measure() -> None:
+            try:
+                sizes = storage_snapshot(self.app.store, self.app.registry)
+            except (EchoActError, OSError):
+                return
+            QTimer.singleShot(0, lambda: screen.set_storage(sizes))
+
+        threading.Thread(target=measure, name="echoact-storage", daemon=True).start()
+
+    def _connect_settings_actions(self, screen: QWidget) -> None:
+        """The buttons that do work rather than change a value.
+
+        Each one is the window's to perform: F-76 requires the deletion
+        scopes to be offered separately and to report what failed, and
+        F-71 requires a revocation to reach that client's running job as
+        well as its credential (5.3).
+        """
+        handlers = {
+            "apply_now_requested": lambda: self._apply_budget_now(screen),
+            "devices_refresh_requested": lambda: self._refresh_devices(screen),
+            "storage_refresh_requested": lambda: self._refresh_storage(screen),
+            "cleanup_requested": lambda: self._clean_up(screen),
+            "credential_issue_requested": lambda *a: self._issue_credential(screen, *a),
+            "credential_reissue_requested": lambda ref: self._reissue_credential(screen, ref),
+            "credential_revoke_requested": lambda ref: self._revoke_credential(screen, ref),
+            "credential_capabilities_changed": (
+                lambda ref, caps: self._set_capabilities(screen, ref, caps)
+            ),
+            "reset_requested": lambda scope: self._reset(screen, scope),
+            "version_check_requested": lambda: self._check_version(screen),
+        }
+        for name, handler in handlers.items():
+            signal = getattr(screen, name, None)
+            if signal is not None:
+                signal.connect(handler)
+
+    def _apply_budget_now(self, screen: QWidget) -> None:
+        """F-78: applying immediately means cancelling the current job,
+        and the view has already confirmed that with the user."""
+        job = self.app.engine.current()
+        if job is not None:
+            try:
+                self.app.engine.cancel(job.job_id)
+            except EchoActError as exc:
+                self._show_problem(exc)
+                return
+        self._refresh_settings_screen(screen)
+        self._refresh_resources()
+
+    def _refresh_devices(self, screen: QWidget) -> None:
+        """F-68: after a resume or a device change, PortAudio still holds
+        the list it built at start-up until it is reinitialised."""
+        from ..audio import devices
+
+        devices.refresh()
+        if hasattr(screen, "reload_devices"):
+            screen.reload_devices()
+
+    def _clean_up(self, screen: QWidget) -> None:
+        """F-73's cleanup: expired data only, and never anything in use."""
+        from ..jobs.engine import clear_temp_tree, expire_one_off_results
+        from ..paths import temp_dir
+        from ..util.logging import prune_old_logs
+
+        try:
+            removed = expire_one_off_results(self.app.store, temp_dir())
+        except EchoActError as exc:
+            self._show_problem(exc)
+            return
+        if not self.app.engine.busy:
+            # N-28 and F-73: data in use by a running job is excluded, and
+            # the scratch tree is exactly what a running job is using.
+            removed += clear_temp_tree(temp_dir())
+        removed += prune_old_logs(ids.now())
+        self._show_notice(tr("Storage"), tr("{n} items cleaned up").format(n=removed))
+        self._refresh_storage(screen)
+
+    def _issue_credential(self, screen: QWidget, name: str, capabilities, days: int) -> None:
+        """F-71: shown once, and only a verifier is kept."""
+        try:
+            issued = self.app.credentials.issue(
+                name=name, capabilities=set(capabilities), days=int(days)
+            )
+        except EchoActError as exc:
+            self._show_problem(exc)
+            return
+        self._show_credential_once(issued)
+        screen.set_credentials(self.app.credentials.list())
+
+    def _reissue_credential(self, screen: QWidget, ref: str) -> None:
+        try:
+            issued = self.app.credentials.reissue(ref)
+        except EchoActError as exc:
+            self._show_problem(exc)
+            return
+        self._show_credential_once(issued)
+        screen.set_credentials(self.app.credentials.list())
+
+    def _revoke_credential(self, screen: QWidget, ref: str) -> None:
+        """5.3: revocation cancels that client's in-progress jobs too."""
+        try:
+            credential = self.app.credentials.get(ref)
+            self.app.credentials.revoke(ref)
+        except EchoActError as exc:
+            self._show_problem(exc)
+            return
+        self._cancel_jobs_of(credential.client_id)
+        screen.set_credentials(self.app.credentials.list())
+
+    def _set_capabilities(self, screen: QWidget, ref: str, capabilities) -> None:
+        try:
+            change = self.app.credentials.set_capabilities(ref, set(capabilities))
+        except EchoActError as exc:
+            self._show_problem(exc)
+            return
+        if change.cancels_jobs:
+            # 5.3: narrowing a client's permissions cancels its running job.
+            self._cancel_jobs_of(change.client_id)
+        screen.set_credentials(self.app.credentials.list())
+
+    def _cancel_jobs_of(self, client_id: str) -> None:
+        job = self.app.engine.current()
+        if job is not None and job.owner_client_id == client_id:
+            try:
+                self.app.engine.cancel(job.job_id)
+            except EchoActError as exc:
+                self._show_problem(exc)
+
+    def _show_credential_once(self, issued) -> None:
+        from .credential_dialog import show_credential
+
+        show_credential(self, issued, self.palette_tokens)
+
+    def _reset(self, screen: QWidget, scope: str) -> None:
+        """F-76's four scopes, each on its own, each reporting failures."""
+        from .settings_view import ResetScope
+
+        failures: list[str] = []
+        try:
+            if scope == ResetScope.VOICE_AND_DISPLAY:
+                self.app.update_settings(
+                    voice=self.app.settings_store.current.voice.with_(tempo=1.0),
+                    volume=1.0,
+                    muted=False,
+                )
+            elif scope == ResetScope.INTEGRATIONS:
+                for credential in list(self.app.credentials.list()):
+                    if not credential.is_owner:
+                        self.app.credentials.revoke(credential.ref)
+                        self._cancel_jobs_of(credential.client_id)
+            elif scope == ResetScope.RETAINED_DATA:
+                deletion = self.app.store.delete_all_history()
+                # N-16 and F-43: a job that is running is not deleted, and
+                # the ones that were skipped are reported rather than
+                # counted as done.
+                failures = list(deletion.blocked_job_ids)
+            elif scope == ResetScope.MODEL_CACHE:
+                self.app.registry.delete(self.app.settings.voice.model_id)
+        except EchoActError as exc:
+            self._show_problem(exc)
+            return
+        if failures:
+            self._show_notice(
+                tr("Some items could not be deleted"), ", ".join(failures[:5]), kind="error"
+            )
+        self._refresh_settings_screen(screen)
+
+    def _check_version(self, screen: QWidget) -> None:
+        """F-75: queried only at the user's request, and nothing is
+        downloaded or installed.  There is no updater in this build, so
+        the honest answer is that the check is unavailable rather than a
+        silent nothing."""
+        screen.set_released_version(
+            None, error=tr("EchoAct cannot check for a newer version in this build.")
         )
 
     def _show_status(self) -> None:
@@ -762,6 +969,8 @@ class MainWindow(QMainWindow):
         language = getattr(screen, "display_language_changed", None)
         if language is not None:
             language.connect(self._apply_display_language)
+
+        self._connect_settings_actions(screen)
 
     def _apply_setting(self, field: str, value: object) -> None:
         try:
