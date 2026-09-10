@@ -130,10 +130,12 @@ def build(connection: Connection, *, client: RestClient | None = None):
     @mcp.tool
     def estimate_speech(
         text: Annotated[str, "The text to be spoken."],
-        voice_id: Annotated[str | None, "A voice from list_models."] = None,
-        language: Annotated[str | None, "auto, ko or en."] = None,
-        style: Annotated[str | None, "natural, calm, bright or narration."] = None,
-        tempo: Annotated[float | None, "0.70 to 1.50."] = None,
+        model_id: Annotated[str, "From list_models."],
+        voice_id: Annotated[str, "A voice belonging to that model."],
+        gender: Annotated[str, "female or male; must match the voice's own."],
+        language: Annotated[str, "auto, ko or en."] = "auto",
+        style: Annotated[str, "natural, calm, bright or narration."] = "natural",
+        tempo: Annotated[float, "0.70 to 1.50."] = 1.0,
     ) -> dict[str, Any]:
         """Validate and estimate without creating a job or loading a model.
 
@@ -142,7 +144,11 @@ def build(connection: Connection, *, client: RestClient | None = None):
         The figures are approximate by construction: they come from the
         model's recorded throughput, not from a trial run (F-88).
         """
-        body = _settings_body(text=text, voice_id=voice_id, language=language, style=style, tempo=tempo)
+        body = {
+            "text": text,
+            "kind": "speech",
+            "voice": _voice_body(model_id, voice_id, gender, language, style, tempo),
+        }
         return call(lambda: rest.post("/estimate", body))
 
     # -- generation -----------------------------------------------------
@@ -153,10 +159,12 @@ def build(connection: Connection, *, client: RestClient | None = None):
         idempotency_key: Annotated[
             str, "Required. Reuse it on a retry to get the same job back rather than a second one."
         ],
-        voice_id: Annotated[str | None, "A voice from list_models."] = None,
-        language: Annotated[str | None, "auto, ko or en."] = None,
-        style: Annotated[str | None, "natural, calm, bright or narration."] = None,
-        tempo: Annotated[float | None, "0.70 to 1.50."] = None,
+        model_id: Annotated[str, "From list_models."],
+        voice_id: Annotated[str, "A voice belonging to that model."],
+        gender: Annotated[str, "female or male; must match the voice's own."],
+        language: Annotated[str, "auto, ko or en."] = "auto",
+        style: Annotated[str, "natural, calm, bright or narration."] = "natural",
+        tempo: Annotated[float, "0.70 to 1.50."] = 1.0,
         wait_seconds: Annotated[
             float | None,
             "Wait up to this long for the job to finish before answering. "
@@ -174,12 +182,13 @@ def build(connection: Connection, *, client: RestClient | None = None):
         and external URLs out of what an integration can ask EchoAct to
         read.
         """
-        body = _settings_body(
-            text=text, voice_id=voice_id, language=language, style=style, tempo=tempo
-        )
-        body["kind"] = "speech"
-        body["idempotency_key"] = idempotency_key
-        body["retention"] = "retained" if retain else "one_off"
+        body: dict[str, Any] = {
+            "kind": "speech",
+            "idempotency_key": idempotency_key,
+            "text": text,
+            "retain": retain,
+            "voice": _voice_body(model_id, voice_id, gender, language, style, tempo),
+        }
         if wait_seconds is not None:
             body["wait_s"] = max(0.0, min(float(wait_seconds), BOUNDED_WAIT_CEILING_S))
         return call(lambda: rest.post("/jobs", body))
@@ -278,31 +287,32 @@ def build(connection: Connection, *, client: RestClient | None = None):
     return mcp
 
 
-def _settings_body(
-    *,
-    text: str,
-    voice_id: str | None,
-    language: str | None,
-    style: str | None,
-    tempo: float | None,
+def _voice_body(
+    model_id: str,
+    voice_id: str,
+    gender: str,
+    language: str,
+    style: str,
+    tempo: float,
 ) -> dict[str, Any]:
-    """Only what the caller actually named.
+    """The settings, stated in full, exactly as the REST contract wants them.
 
-    Omitting a field lets the service apply the owner's own setting, which
-    is the behaviour F-47 describes -- all entry paths share one set of
-    choices.  Sending a default from here would silently override the
-    owner instead.
+    Nothing here falls back to the owner's current selection, and that is
+    the service's decision rather than this module's: an automated
+    caller's output must not depend on what the person at the keyboard
+    last clicked.  So the tools require the three fields that identify a
+    voice and let ``list_models`` be the place a caller learns them --
+    which is also why they are required *parameters* rather than a
+    runtime error, since a tool schema can say so and an error cannot.
     """
-    body: dict[str, Any] = {"text": text}
-    for name, value in (
-        ("voice_id", voice_id),
-        ("language", language),
-        ("style", style),
-        ("tempo", tempo),
-    ):
-        if value is not None:
-            body[name] = value
-    return body
+    return {
+        "model_id": model_id,
+        "voice_id": voice_id,
+        "gender": gender,
+        "language": language,
+        "style": style,
+        "tempo": tempo,
+    }
 
 
 def preflight(rest: RestClient) -> dict[str, Any]:

@@ -24,6 +24,7 @@ from echoact.errors import Code, EchoActError
 from echoact.mcp import server as mcp_server
 from echoact.mcp.client import RestClient
 from echoact.mcp.config import Connection
+from echoact.models.catalog import SUPERTONIC_3_ID
 
 
 def _free_port() -> int:
@@ -109,10 +110,27 @@ def test_the_estimate_agrees_across_both_surfaces(running) -> None:
     what N-24 means by MCP being a projection."""
     _app, connection = running
     text = "에코액트는 문서를 소리내어 읽어 줍니다. 두 번째 문장입니다."
+    voice = {
+        "model_id": SUPERTONIC_3_ID,
+        "voice_id": "F1",
+        "gender": "female",
+        "language": "auto",
+        "style": "natural",
+        "tempo": 1.0,
+    }
     with RestClient(connection) as rest:
-        direct = rest.post("/estimate", {"text": text})
+        direct = rest.post("/estimate", {"text": text, "kind": "speech", "voice": voice})
         mcp = mcp_server.build(connection, client=rest)
-        through_mcp = _payload(_call(mcp, "estimate_speech", text=text))
+        through_mcp = _payload(
+            _call(
+                mcp,
+                "estimate_speech",
+                text=text,
+                model_id=SUPERTONIC_3_ID,
+                voice_id="F1",
+                gender="female",
+            )
+        )
     assert "error" not in through_mcp, through_mcp
     assert through_mcp.get("segment_count") == direct.get("segment_count")
     assert through_mcp.get("audio_ms") == direct.get("audio_ms")

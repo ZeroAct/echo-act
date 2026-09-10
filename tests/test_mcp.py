@@ -133,7 +133,8 @@ def test_every_tool_makes_exactly_one_request() -> None:
     mcp = mcp_server.build(CONNECTION, client=fake.client())
     for name, kw in (
         ("list_models", {}),
-        ("estimate_speech", {"text": "안녕하세요."}),
+        ("estimate_speech", {"text": "안녕하세요.", "model_id": "supertonic-3",
+                             "voice_id": "F1", "gender": "female"}),
         ("get_speech_job", {"job_id": "job_1"}),
         ("cancel_speech_job", {"job_id": "job_1"}),
         ("list_speech_segments", {"job_id": "job_1"}),
@@ -148,30 +149,54 @@ def test_create_speech_sends_the_kind_and_the_key() -> None:
     """F-54 requires an explicit job kind; F-49 requires the key."""
     fake = FakeService()
     mcp = mcp_server.build(CONNECTION, client=fake.client())
-    _call(mcp, "create_speech", text="안녕하세요.", idempotency_key="k-1")
+    _call(
+        mcp,
+        "create_speech",
+        text="안녕하세요.",
+        idempotency_key="k-1",
+        model_id="supertonic-3",
+        voice_id="F1",
+        gender="female",
+    )
     _method, path, body = fake.calls[-1]
     assert path == "/jobs"
     assert body["kind"] == "speech"
     assert body["idempotency_key"] == "k-1"
-    assert body["retention"] == "one_off"
+    assert body["retain"] is False
 
 
-def test_a_setting_the_caller_did_not_name_is_not_sent() -> None:
-    """F-47 has every entry path share the owner's choices. Sending a
-    default from here would override the owner instead of deferring."""
+def test_the_voice_is_stated_in_full_and_nested_as_the_contract_wants() -> None:
+    """The service refuses to inherit the desktop's current selection, so
+    an automated caller's output does not depend on what the person at the
+    keyboard last clicked. MCP is a projection of that, not a softer
+    version of it."""
     fake = FakeService()
     mcp = mcp_server.build(CONNECTION, client=fake.client())
-    _call(mcp, "create_speech", text="안녕하세요.", idempotency_key="k")
+    _call(
+        mcp,
+        "create_speech",
+        text="안녕하세요.",
+        idempotency_key="k",
+        model_id="supertonic-3",
+        voice_id="F1",
+        gender="female",
+    )
     _m, _p, body = fake.calls[-1]
-    assert "voice_id" not in body
-    assert "tempo" not in body
-    assert "language" not in body
+    assert body["voice"] == {
+        "model_id": "supertonic-3",
+        "voice_id": "F1",
+        "gender": "female",
+        "language": "auto",
+        "style": "natural",
+        "tempo": 1.0,
+    }
+    assert "voice_id" not in body, "the settings belong under 'voice', not at the top level"
 
 
 def test_a_wait_longer_than_the_ceiling_is_clamped() -> None:
     fake = FakeService()
     mcp = mcp_server.build(CONNECTION, client=fake.client())
-    _call(mcp, "create_speech", text="hi", idempotency_key="k", wait_seconds=9999)
+    _call(mcp, "create_speech", text="hi", idempotency_key="k", wait_seconds=9999, model_id="supertonic-3", voice_id="F1", gender="female")
     _m, _p, body = fake.calls[-1]
     assert body["wait_s"] == 60.0
 
@@ -260,7 +285,7 @@ def test_the_services_own_error_code_crosses_unchanged() -> None:
         }
     )
     mcp = mcp_server.build(CONNECTION, client=fake.client())
-    payload = _payload(_call(mcp, "create_speech", text="hi", idempotency_key="k"))
+    payload = _payload(_call(mcp, "create_speech", text="hi", idempotency_key="k", model_id="supertonic-3", voice_id="F1", gender="female"))
     assert payload["error"]["code"] == "BUSY"
     assert payload["error"]["retryable"] is True
     assert payload["error"]["retry_after_s"] == 3.0
