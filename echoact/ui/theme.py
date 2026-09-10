@@ -28,7 +28,7 @@ from enum import StrEnum
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QFont, QFontDatabase, QGuiApplication
 
-from . import icons
+from . import fonts, icons
 
 
 class Mode(StrEnum):
@@ -178,7 +178,7 @@ METRICS = Metrics()
 # falls back to the best per-OS pair, which is correct to look at but means
 # a measurement taken on one machine does not transfer to another.  The
 # fallback is ordered, not a guess: the first entry present wins.
-BUNDLED_FAMILY = "Pretendard"  # SIL OFL; not yet bundled, see A.4
+BUNDLED_FAMILY = fonts.BUNDLED_FAMILY  # SIL OFL; fetched by scripts/fetch_fonts.py
 _FALLBACKS = (
     "Pretendard",
     "Malgun Gothic",  # Windows Korean, ships with the OS

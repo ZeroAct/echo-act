@@ -46,6 +46,15 @@ def main(argv: list[str] | None = None) -> int:
     qt.setApplicationName("EchoAct")
     qt.setOrganizationName("EchoAct")
 
+    # Before anything measures a glyph: a face registered later would not
+    # be the one the first layout used, and N-13's stability is about the
+    # layout not changing under the reader.
+    from .ui import fonts
+
+    report = fonts.load()
+    if not report.metrics_are_portable:
+        log.info("no bundled typeface; layout measurements are machine-specific")
+
     try:
         app = Application()
     except EchoActError as exc:

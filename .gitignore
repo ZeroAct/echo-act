@@ -219,3 +219,7 @@ __marimo__/
 
 # Spike render output
 spikes/_out/
+
+# Fetched by scripts/fetch_fonts.py, not committed: a checkout should not
+# acquire a third-party licence obligation as a side effect of cloning.
+echoact/assets/fonts/
