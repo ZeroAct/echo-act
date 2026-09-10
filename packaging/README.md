@@ -36,6 +36,28 @@ and `-m` means nothing to it. So the binary re-invokes itself: `--worker` for th
 synthesis child A.2's process layout needs, `--mcp` for the stdio MCP server an
 MCP client starts. Neither flag is a public interface.
 
+## What the build was checked against
+
+A Windows directory build was produced and exercised, so the layout above is
+what came out rather than what was intended:
+
+- `dist/EchoAct/` is 230 MB before any model, with Qt as separate DLLs under
+  `_internal/PySide6/` — which is the arrangement LGPL relinking needs.
+- The executable re-invokes itself correctly. `EchoAct.exe --mcp` reports a
+  missing credential and exits, and the real supervisor drove
+  `EchoAct.exe --worker` through a load and a synthesis: the frozen child
+  loaded the model in 0.86 s at 44,100 Hz with ten voices, produced 4.74
+  seconds of audio in 1.47, reported 495 MiB through the Job Object, and was
+  released in 0.09 s. F-87's provider allow-list held inside the bundle, which
+  is the check worth having: the runtime is packaged differently there.
+- The application starts, creates its data tree, and takes the single-instance
+  lock (F-85).
+- It logs that no typeface is bundled, so a measurement taken from this build
+  is machine-specific. Fetch the font for a release build.
+
+Not checked, because neither certificate exists yet: signing, notarization, and
+installation on a machine that has never seen the build.
+
 ## Windows signing
 
 Needs an EV or OV code-signing certificate on a hardware token or in a cloud
