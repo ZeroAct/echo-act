@@ -39,6 +39,7 @@ from typing import Any
 from ..audio import wav
 from ..config.budget import HaltReason, ResourceSampler, halt_decision, resolve_budget_from_system
 from ..config.settings import Settings
+from ..db.backup import RESTORE_GATE
 from ..db.store import Store
 from ..domain import (
     Budget,
@@ -217,6 +218,12 @@ class JobEngine:
         exists, and a busy response creates none.  If the claim then finds
         an existing job, the slot is handed straight back.
         """
+        # 5.3: during a restore, new generation and edits are blocked.
+        # Checked before anything else because it is the cheapest refusal
+        # and the only one that is temporary by construction -- the
+        # restore will finish, so this is retryable where the others are
+        # the caller's to fix.
+        RESTORE_GATE.require_idle("Generating speech")
         entry = validate_request(request, self._manifest)
         budget = resolve_budget_from_system(self._settings)
 

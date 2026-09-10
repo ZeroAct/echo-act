@@ -25,6 +25,7 @@ from typing import Any
 
 from .audio.player import Player
 from .config.settings import Settings, SettingsModelPreferences, SettingsStore
+from .db.backup import BackupScheduler
 from .db.store import Store
 from .domain import Capability
 from .engine.supervisor import WorkerSupervisor
@@ -105,6 +106,7 @@ class Application:
             settings=self.settings,
         )
         self.player = Player()
+        self.scheduler = BackupScheduler()
         self.service: Any = None  # set by start_service, if it starts
 
         self._recover()
@@ -160,6 +162,43 @@ class Application:
             self.startup.owner_credential = issued
         except EchoActError as exc:
             self.startup.problems.append(Problem(exc.code, exc.message))
+
+    # ------------------------------------------------------------------
+    # Scheduled backup (F-74, N-28)
+    # ------------------------------------------------------------------
+
+    def run_due_backup(self, now: float | None = None) -> Any:
+        """Take the daily backup if one is due.  Returns the outcome or None.
+
+        Called on a timer by whoever owns one, and never on the Qt main
+        thread: a backup copies the whole library.  Everything F-74 asks
+        for is decided inside the scheduler -- once a day, only while the
+        app is running, deferred during generation and during a restore, a
+        missed schedule made up once rather than accumulating -- so this is
+        only the tick and the two facts the scheduler cannot see for
+        itself: whether a job is running, and where the owner wants it.
+
+        N-28 puts a scheduled backup behind the user's generation and
+        playback, which is why ``generating`` is passed rather than
+        inferred: deferring is the scheduler's decision, but knowing is
+        this object's.
+        """
+        settings = self.settings
+        if not settings.scheduled_backup:
+            return None
+        try:
+            return self.scheduler.run_due(
+                self.store,
+                ids.now() if now is None else now,
+                enabled=True,
+                location=settings.scheduled_backup_location,
+                generating=self.engine.busy,
+            )
+        except EchoActError as exc:
+            # F-70 notifies a backup failure; it is never a reason to stop.
+            log.warning("scheduled backup: %s", exc.code.value)
+            self.startup.problems.append(Problem(exc.code, exc.message))
+            return None
 
     # ------------------------------------------------------------------
     # Settings
