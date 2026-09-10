@@ -21,6 +21,21 @@ from .util.logging import configure, get_logger
 log = get_logger("main")
 
 
+def _fatal(message: str, lock) -> None:
+    """Report and let go of the single-instance lock.
+
+    Releasing matters: a failed start that keeps the lock makes the next
+    attempt look like F-85's "another instance is running", and the user
+    would then be told the opposite of what happened.
+    """
+    try:
+        from PySide6.QtWidgets import QMessageBox
+
+        QMessageBox.critical(None, "EchoAct", message)
+    finally:
+        lock.release()
+
+
 def main(argv: list[str] | None = None) -> int:
     configure()
     argv = list(sys.argv if argv is None else argv)
@@ -58,10 +73,18 @@ def main(argv: list[str] | None = None) -> int:
     try:
         app = Application()
     except EchoActError as exc:
-        from PySide6.QtWidgets import QMessageBox
-
-        QMessageBox.critical(None, "EchoAct", exc.message)
-        lock.release()
+        # Logged before it is shown. A dialog is seen once by whoever is
+        # at the machine; F-25 wants a failure reported, and F-72's
+        # diagnostic export can only carry what reached the log.
+        log.error("startup failed: %s: %s", exc.code.value, exc.message)
+        _fatal(exc.message, lock)
+        return 1
+    except Exception as exc:  # noqa: BLE001 - the last thing between us and silence
+        # Anything that is not an EchoActError is a defect rather than a
+        # condition, and until now it left the process holding a dialog
+        # with nothing in the log to say why.
+        log.exception("startup failed unexpectedly")
+        _fatal(f"EchoAct could not start ({type(exc).__name__}).", lock)
         return 1
 
     window = MainWindow(app, theme.Mode.SYSTEM)

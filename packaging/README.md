@@ -50,8 +50,15 @@ what came out rather than what was intended:
   seconds of audio in 1.47, reported 495 MiB through the Job Object, and was
   released in 0.09 s. F-87's provider allow-list held inside the bundle, which
   is the check worth having: the runtime is packaged differently there.
-- The application starts, creates its data tree, and takes the single-instance
-  lock (F-85).
+- The application starts, creates its data tree, takes the single-instance lock
+  (F-85), mints its owner credential (N-31), and serves on 127.0.0.1:8765.
+- The first build did none of the last three. It omitted `echoact/db/schema.sql`,
+  because the spec declared only the fonts as data, and the symptom was a window
+  that opened, answered DB_UNAVAILABLE, and wrote nothing further to the log. The
+  spec now collects package data by walking the tree, `tests/test_packaging.py`
+  fails if a suffix appears that the collector would miss, and a startup failure
+  is logged before it is shown — it was not, which is why the first diagnosis
+  needed a rebuild.
 - It logs that no typeface is bundled, so a measurement taken from this build
   is machine-specific. Fetch the font for a release build.
 
