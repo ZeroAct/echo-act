@@ -29,6 +29,61 @@ SEGMENT_MAX_SECONDS: Final = 20.0
 FIRST_SEGMENT_MAX_SECONDS: Final = 8.0
 SEGMENT_MIN_CODEPOINTS: Final = 20
 
+# Estimating audio length from source length.
+#
+# F-81 splits on an estimated duration and F-88 quotes one to a caller, so
+# the numbers have to come from the engine rather than from intuition.  These
+# are measured against Supertonic 3 at tempo 1.00, two threads, voice F1:
+# Korean 6.0 code points per second of audio (range 3.7 to 6.4), English 13.3
+# (range 7.2 to 14.0).  Short sentences sit at the low end because onset and
+# trailing silence are a larger fraction of them, so using the median
+# over-estimates a short segment's length -- which is the safe direction for
+# a cap.  Tempo divides duration almost exactly: 0.70x measured 1.43x the
+# 1.00x length and 1.50x measured 0.67x, so ``seconds / tempo`` is the model.
+ESTIMATE_CODEPOINTS_PER_SECOND_KO: Final = 6.0
+ESTIMATE_CODEPOINTS_PER_SECOND_EN: Final = 13.3
+#: Seconds of computation per second of audio, at the Section 8.2 baseline.
+#: Median 0.24, worst case 0.34; the worst case is quoted so an estimate is
+#: not optimistic about a machine that is busier than the one measured.
+ESTIMATE_REAL_TIME_FACTOR: Final = 0.35
+
+# ----------------------------------------------------------- engine call ---
+# Fixed arguments for every synthesis call.  Both exist to keep a segment's
+# duration exactly known rather than inferred:
+#
+# * The engine re-chunks long text on its own (120 code points for Korean)
+#   and would then decide its own internal boundaries.  A large limit makes
+#   one of our segments exactly one engine call.
+# * The engine's own inter-chunk silence is inert once we chunk first, which
+#   A.5 measured, so F-82 makes inter-segment silence the app's to insert.
+#   Asking for zero states that intent rather than relying on the accident.
+ENGINE_MAX_CHUNK_CODEPOINTS: Final = 100_000
+ENGINE_SILENCE_DURATION_S: Final = 0.0
+#: Diffusion steps.  A.5 measured RTF 0.067 at the fastest setting and 0.207
+#: at this one; the margin over playback is fivefold either way, so quality
+#: wins.
+ENGINE_TOTAL_STEPS: Final = 8
+
+# F-08's speaking styles, as the preset the requirement describes: a tempo
+# multiplier applied on top of the user's own tempo, and the inter-segment
+# pause the app inserts per F-82.  A style never changes which characters are
+# spoken.  The product of the two tempi is clamped to F-07's range, so a
+# style can never take tempo outside what the user is told is possible.
+STYLE_TEMPO_MULTIPLIER: Final = {
+    "natural": 1.00,
+    "calm": 0.92,
+    "bright": 1.08,
+    "narration": 0.97,
+}
+STYLE_SEGMENT_GAP_MS: Final = {
+    "natural": 250,
+    "calm": 400,
+    "bright": 180,
+    "narration": 320,
+}
+#: Extra pause where the source text itself had a paragraph break.
+PARAGRAPH_EXTRA_GAP_MS: Final = 350
+
 # ---------------------------------------------------------------- voice ---
 TEMPO_MIN: Final = 0.70  # F-07
 TEMPO_MAX: Final = 1.50
