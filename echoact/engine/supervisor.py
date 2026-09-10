@@ -63,6 +63,25 @@ log = get_logger("engine.supervisor")
 #: interpreter -- no script path to get wrong when the app is packaged.
 WORKER_MODULE: Final = "echoact.engine.worker"
 
+#: The flag the frozen executable uses to become a worker instead of the
+#: application.  See packaging/entry.py.
+WORKER_FLAG: Final = "--worker"
+
+
+def default_worker_command() -> tuple[str, ...]:
+    """How to start a worker, which differs between a checkout and a build.
+
+    From a checkout ``sys.executable`` is a Python interpreter and ``-m``
+    works.  Inside a PyInstaller bundle it is the frozen application and
+    ``-m`` means nothing to it, so the executable re-invokes itself with a
+    flag and dispatches.  Deciding here rather than at each call site
+    means the supervisor's tests, which pass their own command, are
+    unaffected either way.
+    """
+    if getattr(sys, "frozen", False):
+        return (sys.executable, WORKER_FLAG)
+    return (sys.executable, "-m", WORKER_MODULE)
+
 # Section 4 fixes no timeout for an individual engine request, so these
 # borrow the two waits it does fix rather than inventing numbers here.  A
 # request that blows its deadline is treated as a dead worker, which is the
@@ -173,7 +192,7 @@ class WorkerSupervisor:
         start_timeout_s: float = START_TIMEOUT_S,
     ) -> None:
         self._command: tuple[str, ...] = tuple(
-            command if command is not None else (sys.executable, "-m", WORKER_MODULE)
+            command if command is not None else default_worker_command()
         )
         self._container_factory = container_factory
         self._env_overrides = dict(env or {})
