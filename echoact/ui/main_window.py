@@ -81,6 +81,7 @@ add_korean(
             "본문이 오디오와 달라 강조 표시를 사용할 수 없습니다",
         "Following paused": "따라가기 일시 중지됨",
         "Open a text file": "텍스트 파일 열기",
+        "Activity": "활동",
         "Text files (*.txt *.md);;All files (*)": "텍스트 파일 (*.txt *.md);;모든 파일 (*)",
         "Save audio": "오디오 저장",
         "WAV audio (*.wav)": "WAV 오디오 (*.wav)",
@@ -174,6 +175,7 @@ class MainWindow(QMainWindow):
         for key, name, glyph in (
             ("library", tr("Library"), "library"),
             ("models", tr("Models"), "cube"),
+            ("status", tr("Activity"), "plug"),
             ("settings", tr("Settings"), "settings"),
         ):
             b = QPushButton("  " + name)
@@ -298,6 +300,11 @@ class MainWindow(QMainWindow):
             lambda on: self.app.update_settings(autoplay=on)
         )
         self.voice_panel.follow_toggled.connect(self._on_follow_toggled)
+
+        self.nav["library"].clicked.connect(self._show_library)
+        self.nav["models"].clicked.connect(self._show_models)
+        self.nav["settings"].clicked.connect(self._show_settings)
+        self.nav["status"].clicked.connect(self._show_status)
 
         self.open_button.clicked.connect(self._open_file)
         self.save_button.clicked.connect(self._save_audio)
@@ -597,17 +604,10 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _open_file(self) -> None:
-        if self.reading.source_text().strip():
-            # F-36: replacing unsaved input needs confirmation, and a
-            # refusal must leave what is there untouched.
-            answer = QMessageBox.question(
-                self,
-                tr("Replace the text that is already here?"),
-                tr("The text you have now has not been saved."),
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-            )
-            if answer is not QMessageBox.StandardButton.Yes:
-                return
+        # F-36: replacing unsaved input needs confirmation, and a refusal
+        # must leave what is there untouched.
+        if self.reading.source_text().strip() and not self._confirm_replace():
+            return
         path, _ = QFileDialog.getOpenFileName(
             self, tr("Open a text file"), "", tr("Text files (*.txt *.md);;All files (*)")
         )
@@ -663,6 +663,160 @@ class MainWindow(QMainWindow):
                 ),
                 kind="info",
             )
+
+    # ------------------------------------------------------------------
+    # The other screens
+    # ------------------------------------------------------------------
+
+    def _open_screen(self, title: str, widget: QWidget, *, width: int, height: int) -> QDialog:
+        """Show a screen in its own window.
+
+        A separate window rather than a stacked page, so the reading
+        surface and the job it is following are never replaced by
+        something else: F-29 compares the live input against the job
+        snapshot continuously, and a screen that swapped the input out
+        would drop the highlight every time the user opened the library.
+        """
+        dialog = QDialog(self)
+        dialog.setWindowTitle(title)
+        dialog.setModal(False)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(widget)
+        dialog.resize(width, height)
+        dialog.show()
+        return dialog
+
+    def _show_library(self) -> None:
+        from .library import LibraryScreen
+
+        screen = LibraryScreen(self.app.store, self.palette_tokens, manifest=MANIFEST)
+        if hasattr(screen, "open_document"):
+            screen.open_document.connect(self._open_document)
+        if hasattr(screen, "problem"):
+            screen.problem.connect(self._show_problem)
+        self._library = self._open_screen(tr("Library"), screen, width=1000, height=680)
+
+    def _show_models(self) -> None:
+        from ..config.budget import resolve_budget_from_system
+        from .models_view import ModelsView
+
+        try:
+            budget = resolve_budget_from_system(self.app.settings)
+        except EchoActError as exc:
+            self._show_problem(exc)
+            return
+        screen = ModelsView(self.palette_tokens, self.app.registry, budget)
+        if hasattr(screen, "problem"):
+            screen.problem.connect(self._show_problem)
+        self._models = self._open_screen(tr("Models"), screen, width=780, height=680)
+
+    def _show_settings(self) -> None:
+        from .settings_view import SettingsView
+
+        screen = SettingsView(self.palette_tokens, self.app.settings)
+        self._connect_settings(screen)
+        # Wide enough that the section text and the controls beside it do
+        # not need the horizontal scrollbar. N-30 allows scrolling as the
+        # fallback; needing it at the default size is still a bad default.
+        self._settings_screen = self._open_screen(
+            tr("Settings"), screen, width=900, height=780
+        )
+
+    def _show_status(self) -> None:
+        from .status_view import StatusView
+
+        screen = StatusView(self.app, self.palette_tokens)
+        self._status = self._open_screen(tr("Activity"), screen, width=740, height=560)
+
+    def _connect_settings(self, screen: QWidget) -> None:
+        """One place where a settings change becomes an application change.
+
+        Each signal carries the new value and nothing else, so the screen
+        never holds the Application, and F-78's rule -- a change during a
+        job applies to the next job -- is enforced once inside
+        Application.update_settings rather than per control.
+        """
+        pairs = (
+            ("cpu_changed", "cpu_percent"),
+            ("memory_changed", "memory_bytes"),
+            ("volume_changed", "volume"),
+            ("muted_changed", "muted"),
+            ("autoplay_changed", "autoplay"),
+            ("follow_changed", "follow"),
+            ("output_device_changed", "output_device"),
+            ("rest_enabled_changed", "rest_enabled"),
+            ("rest_port_changed", "rest_port"),
+            ("mcp_enabled_changed", "mcp_enabled"),
+            ("credential_days_changed", "credential_days"),
+            ("retention_changed", "retention_bytes"),
+            ("os_notifications_changed", "os_notifications"),
+            ("autosave_documents_changed", "autosave_documents"),
+            ("retain_history_changed", "retain_history"),
+        )
+        for signal_name, field in pairs:
+            signal = getattr(screen, signal_name, None)
+            if signal is not None:
+                signal.connect(lambda value, f=field: self._apply_setting(f, value))
+
+        language = getattr(screen, "display_language_changed", None)
+        if language is not None:
+            language.connect(self._apply_display_language)
+
+    def _apply_setting(self, field: str, value: object) -> None:
+        try:
+            self.app.update_settings(**{field: value})
+        except EchoActError as exc:
+            self._show_problem(exc)
+            return
+        if field in {"volume", "muted"}:
+            self.app.player.set_volume(self.app.settings.volume)
+            self.app.player.set_muted(self.app.settings.muted)
+        elif field == "follow":
+            self.reading.set_follow(bool(value))
+        elif field in {"cpu_percent", "memory_bytes"}:
+            self._refresh_resources()
+        elif field in {"rest_enabled", "rest_port", "mcp_enabled"}:
+            self._restart_service()
+        elif field == "os_notifications":
+            self.notifications.set_os_notifications(bool(value))
+
+    def _apply_display_language(self, value: str) -> None:
+        """F-86.  Only what is shown changes: A-22 requires documents, job
+        snapshots and API responses to be untouched."""
+        from .i18n import Lang, set_language
+
+        self.app.update_settings(display_language=value)
+        set_language(Lang(value) if value in {"ko", "en"} else Lang.SYSTEM)
+
+    def _restart_service(self) -> None:
+        """F-79: a port change restarts the service, not the app, and a
+        failure is an actionable notice rather than a stoppage."""
+        self.app.stop_service()
+        problem = self.app.start_service()
+        self._refresh_service_label()
+        if problem is not None:
+            self._show_notice(problem.code.value, problem.message, kind="error")
+
+    def _open_document(self, document_id: str) -> None:
+        """F-36 still applies here: opening replaces the input, so it asks."""
+        try:
+            document = self.app.store.get_document(document_id)
+        except EchoActError as exc:
+            self._show_problem(exc)
+            return
+        if self.reading.source_text().strip() and not self._confirm_replace():
+            return
+        self.reading.set_text(document.body)
+
+    def _confirm_replace(self) -> bool:
+        answer = QMessageBox.question(
+            self,
+            tr("Replace the text that is already here?"),
+            tr("The text you have now has not been saved."),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+        )
+        return answer is QMessageBox.StandardButton.Yes
 
     # ------------------------------------------------------------------
     # Chrome
