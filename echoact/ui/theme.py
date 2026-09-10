@@ -155,9 +155,16 @@ class Metrics:
     size_section: int = 11
 
     #: Reading line spacing as a percentage.  Korean needs more than Latin
-    #: because Hangul syllable blocks fill the em box; 180 keeps mixed
-    #: Korean/Latin paragraphs from looking crowded.
-    reading_line_height_pct: int = 180
+    #: because Hangul syllable blocks fill the em box, but much past 160 the
+    #: lines stop reading as a paragraph and start reading as a list.
+    reading_line_height_pct: int = 158
+    #: Space between paragraphs, on top of the line height.  Separating the
+    #: two means a blank line in the source does not inherit the full
+    #: reading leading twice over.
+    reading_paragraph_gap: int = 10
+    #: A blank line between paragraphs gets this instead, so one visual gap
+    #: does not cost three line heights.
+    reading_blank_line_height_pct: int = 70
 
 
 METRICS = Metrics()

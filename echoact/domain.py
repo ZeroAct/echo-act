@@ -179,6 +179,32 @@ class VoiceSettings:
     style: SpeakingStyle
     tempo: float
 
+    def __post_init__(self) -> None:
+        """Coerce the enum fields, because they arrive as plain strings.
+
+        Qt hands back a ``str`` for a ``StrEnum`` stored as item data, and
+        JSON gives one too.  A ``StrEnum`` compares equal to its value, so a
+        plain string works everywhere until something asks for ``.value`` --
+        which then fails at the point of use rather than at the boundary.
+        Normalising here keeps the type honest for everyone downstream.
+        """
+        for name, kind in (
+            ("language", Language),
+            ("gender", Gender),
+            ("style", SpeakingStyle),
+        ):
+            value = getattr(self, name)
+            if not isinstance(value, kind):
+                try:
+                    object.__setattr__(self, name, kind(value))
+                except ValueError as exc:
+                    code = {
+                        "language": Code.LANGUAGE_UNKNOWN,
+                        "gender": Code.VOICE_UNKNOWN,
+                        "style": Code.STYLE_UNKNOWN,
+                    }[name]
+                    raise EchoActError(code, detail={name: str(value)}, cause=exc) from exc
+
     def validate(self) -> None:
         if not (TEMPO_MIN - 1e-9 <= self.tempo <= TEMPO_MAX + 1e-9):
             raise EchoActError(

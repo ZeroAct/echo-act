@@ -191,15 +191,34 @@ class ReadingSurface(QTextEdit):
             self._applying_format = False
 
     def _merge_line_height(self) -> None:
+        doc = self.document()
         fmt = QTextBlockFormat()
         fmt.setLineHeight(
             METRICS.reading_line_height_pct,
             QTextBlockFormat.LineHeightTypes.ProportionalHeight.value,
         )
-        cursor = QTextCursor(self.document())
+        fmt.setBottomMargin(METRICS.reading_paragraph_gap)
+        cursor = QTextCursor(doc)
         cursor.select(QTextCursor.SelectionType.Document)
         cursor.mergeBlockFormat(fmt)
         cursor.clearSelection()
+
+        # A blank line between paragraphs is itself a paragraph, so leaving
+        # it at the reading leading spends three line heights on one gap.
+        # Collapsing it keeps a pasted document looking like prose rather
+        # than like a list.
+        blank = QTextBlockFormat()
+        blank.setLineHeight(
+            METRICS.reading_blank_line_height_pct,
+            QTextBlockFormat.LineHeightTypes.ProportionalHeight.value,
+        )
+        blank.setBottomMargin(0)
+        block = doc.begin()
+        while block.isValid():
+            if not block.text().strip():
+                c = QTextCursor(block)
+                c.setBlockFormat(blank)
+            block = block.next()
 
     # -- text ----------------------------------------------------------
 

@@ -1,0 +1,742 @@
+"""The main screen.
+
+N-09 asks that input, voice settings, resource settings, generation, and
+playback all be reachable from here, so this window is wide rather than
+deep: the reading surface takes the space, everything else sits around it,
+and the other screens are one button away.
+
+The window owns every decision.  The panels below it emit intent and show
+state; they never call the engine.  That is what makes "unavailable
+controls are disabled" a single method rather than a rule each widget has
+to remember.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtGui import QAction, QCloseEvent, QKeySequence
+from PySide6.QtWidgets import (
+    QFileDialog,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QMainWindow,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
+
+from ..app import Application
+from ..audio import wav
+from ..audio.player import PlayerState, Timeline
+from ..domain import JobState, RequestPath, RetentionMode, VoiceSettings
+from ..errors import Code, EchoActError
+from ..jobs.engine import Event
+from ..jobs.request import JobRequest, estimate
+from ..models.catalog import MANIFEST
+from ..policy import MAX_INPUT_CODEPOINTS
+from ..text.loader import load_file
+from ..util import ids
+from ..util.logging import get_logger
+from . import icons
+from .bridge import EngineBridge
+from .controls import TransportBar, VoicePanel, label, tool_button
+from .i18n import add_korean, approximate_duration, count, tr
+from .reading import ReadingSurface
+from .theme import METRICS, Mode, Palette
+from .theme import apply as apply_theme
+
+log = get_logger("ui.window")
+
+#: How often the reading position is repainted.  This is a repaint cadence,
+#: not a clock: the position itself comes from the audio callback's frame
+#: counter (N-12, A.2), and 40 ms leaves the 300 ms budget almost entirely
+#: to the device.
+TICK_MS = 40
+
+add_korean(
+    {
+        "{n} / {max} characters": "{n} / {max}자",
+        "Nothing to read yet": "읽을 내용이 없습니다",
+        "{n} segments, {duration}": "{n}개 문장, {duration}",
+        "Generating {done} of {total}": "{total}개 중 {done}개 생성 중",
+        "Ready to read": "읽을 준비가 되었습니다",
+        "Reading": "읽는 중",
+        "Finished": "끝났습니다",
+        "Generation canceled": "생성이 취소되었습니다",
+        "Highlighting unavailable while the text differs from the audio":
+            "본문이 오디오와 달라 강조 표시를 사용할 수 없습니다",
+        "Following paused": "따라가기 일시 중지됨",
+        "Open a text file": "텍스트 파일 열기",
+        "Text files (*.txt *.md);;All files (*)": "텍스트 파일 (*.txt *.md);;모든 파일 (*)",
+        "Save audio": "오디오 저장",
+        "WAV audio (*.wav)": "WAV 오디오 (*.wav)",
+        "Replace the text that is already here?": "이미 입력된 본문을 바꿀까요?",
+        "The text you have now has not been saved.": "지금 입력한 본문은 저장되지 않았습니다.",
+        "Replace": "바꾸기",
+        "Keep": "유지",
+        "Too much text to paste": "붙여넣기에 본문이 너무 많습니다",
+        "Pasting {n} characters would pass the {max} character limit; there is room for {room}.":
+            "{n}자를 붙여넣으면 {max}자 제한을 넘습니다. {room}자만 넣을 수 있습니다.",
+        "A job is still running.": "작업이 아직 실행 중입니다.",
+        "Leave anyway": "그래도 종료",
+        "Stay": "머무르기",
+        "partial": "일부",
+        "This file covers {percent}% of the text.": "이 파일은 본문의 {percent}%를 담고 있습니다.",
+        "Line endings were normalised.": "줄바꿈 문자를 정규화했습니다.",
+    }
+)
+
+
+class MainWindow(QMainWindow):
+    """One window, one job at a time, one reading position."""
+
+    theme_changed = Signal(object)
+
+    def __init__(self, app: Application, mode: Mode = Mode.SYSTEM) -> None:
+        super().__init__()
+        self.app = app
+        self.palette_tokens: Palette = apply_theme(
+            __import__("PySide6.QtWidgets", fromlist=["QApplication"]).QApplication.instance(),
+            mode,
+        )
+        self.setWindowTitle("EchoAct")
+        self.resize(1180, 780)
+        self.setMinimumSize(900, 560)
+
+        self._job_id: str | None = None
+        self._timeline: Timeline | None = None
+        self._snapshot: str = ""
+        self._started_playback = False
+        self._entry = MANIFEST.get(app.settings.voice.model_id)
+
+        self._build()
+        self._wire()
+        self._apply_settings()
+        self._refresh_estimate()
+        self._refresh_resources()
+        self._update_enabled()
+        self._set_status(tr("Ready to read"))
+
+        self._tick = QTimer(self)
+        self._tick.setInterval(TICK_MS)
+        self._tick.timeout.connect(self._on_tick)
+        self._tick.start()
+
+        self._report_startup()
+
+    # ------------------------------------------------------------------
+    # Construction
+    # ------------------------------------------------------------------
+
+    def _build(self) -> None:
+        m = METRICS
+        p = self.palette_tokens
+        root = QWidget()
+        root.setObjectName("Root")
+        outer = QVBoxLayout(root)
+        outer.setContentsMargins(m.pad_wide, m.pad_wide, m.pad_wide, m.pad)
+        outer.setSpacing(m.gap_wide)
+
+        # -- header ----------------------------------------------------
+        head = QHBoxLayout()
+        head.setSpacing(m.gap)
+        head.addWidget(label("EchoAct", "title"))
+        self.model_chip = label("", "muted")
+        head.addWidget(self.model_chip)
+        head.addStretch(1)
+        self.open_button = QPushButton("  " + tr("Open file"))
+        self.open_button.setProperty("variant", "quiet")
+        self.open_button.setIcon(icons.icon("folder", p.text_secondary, p.text_muted))
+        self.open_button.setIconSize(icons.icon_size(16))
+        self.save_button = QPushButton("  " + tr("Save audio"))
+        self.save_button.setProperty("variant", "quiet")
+        self.save_button.setIcon(icons.icon("export", p.text_secondary, p.text_muted))
+        self.save_button.setIconSize(icons.icon_size(16))
+        head.addWidget(self.open_button)
+        head.addWidget(self.save_button)
+
+        head.addSpacing(METRICS.gap)
+        self.nav: dict[str, QPushButton] = {}
+        for key, name, glyph in (
+            ("library", tr("Library"), "library"),
+            ("models", tr("Models"), "cube"),
+            ("settings", tr("Settings"), "settings"),
+        ):
+            b = QPushButton("  " + name)
+            b.setProperty("variant", "quiet")
+            b.setIcon(icons.icon(glyph, p.text_secondary, p.text_muted))
+            b.setIconSize(icons.icon_size(16))
+            b.setAccessibleName(name)
+            head.addWidget(b)
+            self.nav[key] = b
+        outer.addLayout(head)
+
+        # -- notice banner (F-25, F-70) --------------------------------
+        self.notice = QFrame()
+        self.notice.setObjectName("Panel")
+        notice_row = QHBoxLayout(self.notice)
+        notice_row.setContentsMargins(m.pad, m.gap, m.gap, m.gap)
+        notice_row.setSpacing(m.gap)
+        self.notice_icon = QLabel()
+        self.notice_text = label("", "secondary")
+        self.notice_text.setWordWrap(True)
+        notice_row.addWidget(self.notice_icon)
+        notice_row.addWidget(self.notice_text, 1)
+        self.notice_close = tool_button("close", p, size=14)
+        notice_row.addWidget(self.notice_close)
+        self.notice.hide()
+        outer.addWidget(self.notice)
+
+        # -- body ------------------------------------------------------
+        body = QHBoxLayout()
+        body.setSpacing(m.gap_wide)
+
+        column = QVBoxLayout()
+        column.setSpacing(m.gap)
+        self.reading = ReadingSurface(p)
+        column.addWidget(self.reading, 1)
+
+        meta = QHBoxLayout()
+        self.counter = label("", "muted")
+        self.estimate_label = label("", "muted")
+        self.estimate_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        meta.addWidget(self.counter)
+        meta.addStretch(1)
+        self.follow_button = QPushButton("  " + tr("Return to the reading position"))
+        self.follow_button.setProperty("variant", "quiet")
+        self.follow_button.setIcon(icons.icon("locate", p.accent))
+        self.follow_button.setIconSize(icons.icon_size(14))
+        self.follow_button.hide()
+        meta.addWidget(self.follow_button)
+        meta.addWidget(self.estimate_label)
+        column.addLayout(meta)
+
+        self.transport = TransportBar(p)
+        column.addWidget(self.transport)
+
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress.setTextVisible(False)
+        column.addWidget(self.progress)
+
+        self.status = label("", "muted")
+        column.addWidget(self.status)
+        body.addLayout(column, 1)
+
+        self.voice_panel = VoicePanel(p, self._entry)
+        body.addWidget(self.voice_panel, 0, Qt.AlignmentFlag.AlignTop)
+        outer.addLayout(body, 1)
+
+        self.setCentralWidget(root)
+        self._build_status_bar()
+        self._build_menu()
+
+    def _build_status_bar(self) -> None:
+        bar = self.statusBar()
+        self.service_label = label("", "muted")
+        self.usage_label = label("", "muted")
+        bar.addWidget(self.service_label)
+        bar.addPermanentWidget(self.usage_label)
+        self._refresh_service_label()
+
+    def _build_menu(self) -> None:
+        """Menu entries exist so every action has a keyboard route (N-30),
+        not because the window needs a menu."""
+        actions = (
+            (tr("Open file"), QKeySequence.StandardKey.Open, self._open_file),
+            (tr("Save audio"), QKeySequence.StandardKey.Save, self._save_audio),
+            (tr("Read aloud"), QKeySequence("Ctrl+Return"), self._primary_action),
+            (tr("Play"), QKeySequence("Space"), None),
+            (tr("Stop"), QKeySequence("Ctrl+."), self._stop),
+            (tr("Return to the reading position"), QKeySequence("Ctrl+J"), self._return_to_position),
+        )
+        for name, shortcut, slot in actions:
+            if slot is None:
+                continue
+            action = QAction(name, self)
+            action.setShortcut(shortcut)
+            action.triggered.connect(slot)
+            self.addAction(action)
+
+    def _wire(self) -> None:
+        self.bridge = EngineBridge(self.app.engine, self)
+        self.bridge.accepted.connect(self._on_accepted)
+        self.bridge.state_changed.connect(self._on_state)
+        self.bridge.segment_ready.connect(self._on_segment)
+        self.bridge.finished.connect(self._on_finished)
+
+        self.reading.length_changed.connect(self._on_length)
+        self.reading.availability_changed.connect(self._on_availability)
+        self.reading.following_changed.connect(self._on_following)
+        self.reading.paste_refused.connect(self._on_paste_refused)
+
+        self.transport.read_requested.connect(self._primary_action)
+        self.transport.pause_requested.connect(self._toggle_play)
+        self.transport.stop_requested.connect(self._stop)
+        self.transport.seek_requested.connect(self._seek)
+
+        self.voice_panel.changed.connect(self._on_voice_changed)
+        self.voice_panel.autoplay_toggled.connect(
+            lambda on: self.app.update_settings(autoplay=on)
+        )
+        self.voice_panel.follow_toggled.connect(self._on_follow_toggled)
+
+        self.open_button.clicked.connect(self._open_file)
+        self.save_button.clicked.connect(self._save_audio)
+        self.follow_button.clicked.connect(self._return_to_position)
+        self.notice_close.clicked.connect(self.notice.hide)
+
+    def _apply_settings(self) -> None:
+        s = self.app.settings
+        self.voice_panel.apply(s.voice, autoplay=s.autoplay, follow=s.follow)
+        self.reading.set_follow(s.follow)
+        self.app.player.set_volume(s.volume)
+        self.app.player.set_muted(s.muted)
+        state = self.app.registry.status(s.voice.model_id)
+        ready = getattr(state, "state", None)
+        self.model_chip.setText(
+            f"{self._entry.display_name} · {self._entry.sample_rate // 1000}.{(self._entry.sample_rate // 100) % 10} kHz"
+            + ("" if str(ready) == "ready" else " · " + tr("not prepared"))
+        )
+
+    # ------------------------------------------------------------------
+    # Starting and stopping a job
+    # ------------------------------------------------------------------
+
+    def _primary_action(self) -> None:
+        """One button: start, or cancel what is running.
+
+        A.3 makes cancelling the owner's way to reclaim the single slot,
+        and F-69 asks for it to be reachable in one place.
+        """
+        if self.app.engine.busy:
+            self._cancel()
+        else:
+            self._start()
+
+    def _start(self) -> None:
+        text = self.reading.source_text()
+        settings = self.voice_panel.settings()
+        request = JobRequest(
+            text=text,
+            settings=settings,
+            request_path=RequestPath.GUI,
+            owner_client_id="owner",
+            # A fresh key per press. F-49 exists to stop a retry becoming a
+            # second job, and a double-click is a retry.
+            idempotency_key=ids.request_id(),
+            retention=(
+                RetentionMode.RETAINED if self.app.settings.retain_history else RetentionMode.ONE_OFF
+            ),
+        )
+        try:
+            job, created = self.app.engine.submit(request)
+        except EchoActError as exc:
+            self._show_problem(exc)
+            return
+
+        self._job_id = job.job_id
+        self._snapshot = text
+        self._started_playback = False
+        self._timeline = Timeline(sample_rate=self._entry.sample_rate)
+        self.app.player.load(self._timeline)
+        self.reading.attach_job(text, self.app.store.list_segments(job.job_id))
+        self.progress.setValue(0)
+        self._update_enabled()
+        if not created:
+            self._set_status(tr("Ready to read"))
+
+    def _cancel(self) -> None:
+        if not self._job_id:
+            return
+        try:
+            self.app.engine.cancel(self._job_id)
+        except EchoActError as exc:
+            self._show_problem(exc)
+
+    # ------------------------------------------------------------------
+    # Engine events, already on the GUI thread
+    # ------------------------------------------------------------------
+
+    def _on_accepted(self, event: Event) -> None:
+        self._set_status(tr("Preparing the model"))
+        self._update_enabled()
+
+    def _on_state(self, event: Event) -> None:
+        if event.job_id != self._job_id:
+            return
+        text = {
+            JobState.PREPARING_MODEL: tr("Preparing the model"),
+            JobState.GENERATING: tr("Generating"),
+            JobState.COMPLETE: tr("Finished"),
+            JobState.CANCELING: tr("Cancel generation"),
+            JobState.CANCELED: tr("Generation canceled"),
+            JobState.FAILED: tr("Failed"),
+        }.get(event.state or JobState.ACCEPTED, "")
+        self._set_status(text)
+        self._update_enabled()
+
+    def _on_segment(self, event: Event) -> None:
+        """A segment is ready: extend the timeline and start if asked to.
+
+        F-12 starts playback at the first ready segment; F-83 lets the user
+        turn that off, and F-51 forbids it for a job an integration
+        created -- which is why this checks the job is ours as well as the
+        setting.
+        """
+        if event.job_id != self._job_id or self._timeline is None:
+            return
+        detail = event.detail
+        start_ms, end_ms = int(detail.get("start_ms", 0)), int(detail.get("end_ms", 0))
+        frames = int(detail.get("frame_count", 0))
+        sr = self._timeline.sample_rate
+        span_frames = wav.frames_for_ms(end_ms, sr) - wav.frames_for_ms(start_ms, sr)
+        self._timeline.append(
+            event.segment_index or 0,
+            str(detail.get("audio_path", "")),
+            frames,
+            max(0, span_frames - frames),
+        )
+        self.app.player.timeline_grew()
+        self.reading.update_segments(self.app.store.list_segments(event.job_id))
+        self.transport.set_playable(self._timeline.duration_ms)
+
+        if event.total:
+            self.progress.setValue(int(100 * event.generated / event.total))
+            self._set_status(
+                tr("Generating {done} of {total}").format(done=event.generated, total=event.total)
+            )
+        if not self._started_playback and self.app.settings.autoplay:
+            self._started_playback = True
+            self._play()
+
+    def _on_finished(self, event: Event) -> None:
+        if event.job_id != self._job_id:
+            return
+        if self._timeline is not None:
+            self._timeline.complete = True
+        self.progress.setValue(100 if event.state is JobState.COMPLETE else self.progress.value())
+        self._update_enabled()
+        if event.state is JobState.FAILED and event.error_code:
+            self._show_notice(tr("Failed"), event.error_code, kind="error")
+        elif event.state is JobState.COMPLETE and event.client_label:
+            # F-70: a job an integration created names the client that
+            # asked for it, so work made while nobody was watching can be
+            # found.
+            self._show_notice(tr("Finished"), event.client_label, kind="ok")
+
+    # ------------------------------------------------------------------
+    # Playback
+    # ------------------------------------------------------------------
+
+    def _play(self) -> None:
+        try:
+            self.app.player.play()
+        except EchoActError as exc:
+            self._show_problem(exc)
+            return
+        self.reading.set_playing()
+        self.transport.set_playback_state("", playing=True)
+
+    def _toggle_play(self) -> None:
+        player = self.app.player
+        if player.state is PlayerState.PLAYING:
+            player.pause()
+            self.reading.set_paused()
+            self.transport.set_playback_state("", playing=False)
+        else:
+            self._play()
+
+    def _stop(self) -> None:
+        """F-13: stopping playback does not stop generation."""
+        self.app.player.stop()
+        self.reading.clear_highlight()
+        self.transport.set_playback_state("", playing=False)
+        self.transport.set_position(0)
+
+    def _seek(self, ms: int) -> None:
+        if not self.app.player.seek_ms(ms):
+            # F-14: ungenerated audio cannot be sought to. Snap back rather
+            # than pretend the seek happened.
+            self.transport.set_position(self.app.player.position_ms())
+
+    def _on_tick(self) -> None:
+        player = self.app.player
+        if self._timeline is None:
+            return
+        position = player.position_ms()
+        waiting = player.state is PlayerState.WAITING
+        if not self.transport.scrubbing:
+            self.transport.set_position(position)
+        if player.state in (PlayerState.PLAYING, PlayerState.WAITING):
+            self.reading.set_playback_ms(position, waiting=waiting)
+        if player.state is PlayerState.ENDED:
+            self.reading.clear_highlight()
+            self.transport.set_playback_state("", playing=False)
+        self._refresh_usage()
+
+    # ------------------------------------------------------------------
+    # Input
+    # ------------------------------------------------------------------
+
+    def _on_length(self, n: int) -> None:
+        self.counter.setText(
+            tr("{n} / {max} characters").format(n=count(n), max=count(MAX_INPUT_CODEPOINTS))
+        )
+        self._refresh_estimate()
+        self._update_enabled()
+
+    def _refresh_estimate(self) -> None:
+        """F-88's estimate, shown to the person as well as to a caller.
+
+        Cheap enough to run on every keystroke -- it is segmentation and
+        arithmetic, and it explicitly does not touch the engine.
+        """
+        text = self.reading.source_text()
+        if not text.strip():
+            self.estimate_label.setText(tr("Nothing to read yet"))
+            return
+        est = estimate(
+            text,
+            self.voice_panel.settings(),
+            MANIFEST,
+            slot_free=not self.app.engine.busy,
+            model_ready=True,
+        )
+        if not est.valid:
+            self.estimate_label.setText(est.problems[0]["message"] if est.problems else "")
+            return
+        self.estimate_label.setText(
+            tr("{n} segments, {duration}").format(
+                n=est.segment_count, duration=approximate_duration(est.audio_ms)
+            )
+        )
+
+    def _on_voice_changed(self, settings: VoiceSettings) -> None:
+        self.app.update_settings(voice=settings)
+        self._refresh_estimate()
+        self._refresh_resources()
+
+    def _on_follow_toggled(self, on: bool) -> None:
+        self.app.update_settings(follow=on)
+        self.reading.set_follow(on)
+
+    def _on_availability(self, available: bool) -> None:
+        if available:
+            self.notice.hide()
+        elif self._job_id:
+            self._show_notice(
+                tr("Highlighting unavailable"),
+                tr("Highlighting unavailable while the text differs from the audio"),
+                kind="info",
+            )
+
+    def _on_following(self, following: bool) -> None:
+        self.follow_button.setVisible(self.reading.following_suspended)
+
+    def _return_to_position(self) -> None:
+        self.reading.return_to_position()
+        self.follow_button.hide()
+
+    def _on_paste_refused(self, attempted: int, room: int) -> None:
+        QMessageBox.information(
+            self,
+            tr("Too much text to paste"),
+            tr(
+                "Pasting {n} characters would pass the {max} character limit; "
+                "there is room for {room}."
+            ).format(n=count(attempted), max=count(MAX_INPUT_CODEPOINTS), room=count(room)),
+        )
+
+    # ------------------------------------------------------------------
+    # Files
+    # ------------------------------------------------------------------
+
+    def _open_file(self) -> None:
+        if self.reading.source_text().strip():
+            # F-36: replacing unsaved input needs confirmation, and a
+            # refusal must leave what is there untouched.
+            answer = QMessageBox.question(
+                self,
+                tr("Replace the text that is already here?"),
+                tr("The text you have now has not been saved."),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            )
+            if answer is not QMessageBox.StandardButton.Yes:
+                return
+        path, _ = QFileDialog.getOpenFileName(
+            self, tr("Open a text file"), "", tr("Text files (*.txt *.md);;All files (*)")
+        )
+        if not path:
+            return
+        try:
+            loaded = load_file(path)
+        except EchoActError as exc:
+            # F-32: on any failure the existing input is left as it was.
+            self._show_problem(exc)
+            return
+        self.reading.set_text(loaded.text)
+        if loaded.line_endings_normalised:
+            # The one edit the loader makes, said out loud: a user counting
+            # characters would otherwise be counting something else.
+            self._show_notice(loaded.source_name, tr("Line endings were normalised."), kind="info")
+
+    def _save_audio(self) -> None:
+        """F-16, including the partial case.
+
+        A job that has not finished can still be saved; the file is named
+        and labelled partial and the coverage is reported, so it is never
+        mistaken for the whole document.
+        """
+        if not self._job_id:
+            return
+        segments = self.app.store.list_segments(self._job_id)
+        ready = [s for s in segments if s.ready]
+        if not ready:
+            return
+        complete = len(ready) == len(segments)
+        suggested = "reading.wav" if complete else "reading-partial.wav"
+        path, _ = QFileDialog.getSaveFileName(
+            self, tr("Save audio"), suggested, tr("WAV audio (*.wav)")
+        )
+        if not path:
+            return
+        try:
+            report = wav.export_partial(
+                segments,
+                Path(path),
+                sample_rate=self._entry.sample_rate,
+                total_codepoints=len(self._snapshot),
+            )
+        except EchoActError as exc:
+            self._show_problem(exc)
+            return
+        if not report.complete:
+            self._show_notice(
+                tr("partial"),
+                tr("This file covers {percent}% of the text.").format(
+                    percent=int(report.coverage * 100)
+                ),
+                kind="info",
+            )
+
+    # ------------------------------------------------------------------
+    # Chrome
+    # ------------------------------------------------------------------
+
+    def _update_enabled(self) -> None:
+        busy = self.app.engine.busy
+        has_text = bool(self.reading.source_text().strip())
+        over = len(self.reading.source_text()) > MAX_INPUT_CODEPOINTS
+        self.transport.read.setEnabled(busy or (has_text and not over))
+        self.transport.set_generating(busy)
+        self.voice_panel.set_locked(busy)
+        playable = self._timeline is not None and self._timeline.total_frames > 0
+        self.transport.pause.setEnabled(playable)
+        self.transport.stop.setEnabled(playable)
+        self.save_button.setEnabled(playable)
+        self.open_button.setEnabled(not busy)
+
+    def _set_status(self, text: str) -> None:
+        self.status.setText(text)
+
+    def _refresh_resources(self) -> None:
+        """F-78 shows the configured value; the job shows what it ran under.
+
+        This is the configured one, because no job is running when the user
+        is reading it -- and when one is, the status bar carries the live
+        figures instead.
+        """
+        from ..config.budget import resolve_budget_from_system
+        from .i18n import memory_size
+
+        try:
+            budget = resolve_budget_from_system(self.app.settings)
+        except EchoActError as exc:
+            self.voice_panel.set_resource_summary(exc.message)
+            return
+        self.voice_panel.set_resource_summary(
+            f"{tr('CPU')} {budget.cpu_percent}%  ·  {memory_size(budget.memory_bytes)}"
+        )
+
+    def _refresh_service_label(self) -> None:
+        s = self.app.settings
+        if self.app.service_running:
+            state = f"{tr('Local service')} {tr('on')} · 127.0.0.1:{s.rest_port}"
+        elif s.rest_enabled:
+            state = tr("Integrations unavailable")
+        else:
+            state = f"{tr('Local service')} {tr('off')}"
+        mcp = f" · MCP {tr('on') if s.mcp_enabled else tr('off')}"
+        self.service_label.setText(state + mcp)
+
+    def _refresh_usage(self) -> None:
+        """F-22: usage while generating, and while idle with a model held."""
+        usage = None
+        try:
+            usage = self.app.supervisor.usage()
+        except Exception:  # noqa: BLE001 - a usage read must never break a tick
+            usage = None
+        if usage is None:
+            self.usage_label.setText("")
+            return
+        from .i18n import memory_size
+
+        self.usage_label.setText(
+            f"{tr('CPU')} {usage.cpu_percent:.0f}%  ·  "
+            f"{tr('Memory')} {memory_size(usage.rss_bytes)}"
+        )
+
+    def _show_notice(self, title: str, detail: str, *, kind: str = "info") -> None:
+        p = self.palette_tokens
+        colour = {"info": p.accent, "ok": p.ok, "error": p.danger}.get(kind, p.accent)
+        name = {"info": "info", "ok": "check-circle", "error": "error"}.get(kind, "info")
+        self.notice_icon.setPixmap(icons.pixmap(name, colour, 18, self.devicePixelRatioF()))
+        self.notice_text.setText(f"{title} — {detail}" if detail else title)
+        self.notice.show()
+
+    def _show_problem(self, exc: EchoActError) -> None:
+        """F-25: a failure is reported with a reason, not a shrug."""
+        if exc.code is Code.BUSY:
+            self._show_notice(tr("A job is still running."), exc.message, kind="info")
+            return
+        self._show_notice(exc.code.value, exc.message, kind="error")
+        log.info("reported to user: %s", exc.code.value)
+
+    def _report_startup(self) -> None:
+        st = self.app.startup
+        if st.interrupted_jobs:
+            self._show_notice(
+                tr("Interrupted"),
+                f"{len(st.interrupted_jobs)}",
+                kind="info",
+            )
+        elif st.problems:
+            first = st.problems[0]
+            self._show_notice(first.code.value, first.message, kind="error")
+
+    # ------------------------------------------------------------------
+    # Exit (F-77, F-52)
+    # ------------------------------------------------------------------
+
+    def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt override
+        if self.app.engine.busy:
+            answer = QMessageBox.question(
+                self,
+                tr("A job is still running."),
+                tr("The text you have now has not been saved."),
+                QMessageBox.StandardButton.Close | QMessageBox.StandardButton.Cancel,
+            )
+            if answer is not QMessageBox.StandardButton.Close:
+                event.ignore()
+                return
+        self._tick.stop()
+        self.bridge.detach()
+        self.app.shutdown()
+        event.accept()
