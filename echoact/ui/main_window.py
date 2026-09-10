@@ -48,6 +48,13 @@ from .bridge import EngineBridge
 from .controls import TransportBar, VoicePanel, label, tool_button
 from .i18n import add_korean, approximate_duration, count, tr
 from .licence import LicenceDialog
+from .notifications import (
+    Level,
+    Notice,
+    NotificationCentre,
+    completion_notice,
+    failure_notice,
+)
 from .reading import ReadingSurface
 from .theme import METRICS, Mode, Palette
 from .theme import apply as apply_theme
@@ -267,6 +274,9 @@ class MainWindow(QMainWindow):
             self.addAction(action)
 
     def _wire(self) -> None:
+        self.notifications = NotificationCentre(
+            os_notifications=self.app.settings.os_notifications
+        )
         self.bridge = EngineBridge(self.app.engine, self)
         self.bridge.accepted.connect(self._on_accepted)
         self.bridge.state_changed.connect(self._on_state)
@@ -445,12 +455,19 @@ class MainWindow(QMainWindow):
         self.progress.setValue(100 if event.state is JobState.COMPLETE else self.progress.value())
         self._update_enabled()
         if event.state is JobState.FAILED and event.error_code:
-            self._show_notice(tr("Failed"), event.error_code, kind="error")
-        elif event.state is JobState.COMPLETE and event.client_label:
-            # F-70: a job an integration created names the client that
-            # asked for it, so work made while nobody was watching can be
-            # found.
-            self._show_notice(tr("Finished"), event.client_label, kind="ok")
+            self._post(failure_notice(tr("Generation failed"), event.error_code, job_id=event.job_id))
+        elif event.state is JobState.COMPLETE:
+            # F-70. A job the user started needs no explanation; one an
+            # integration created needs two things said, because the user
+            # did not ask for it and a one-off result goes within the hour.
+            job = self.app.store.get_job(event.job_id, include_segments=False)
+            self._post(
+                completion_notice(
+                    job_id=event.job_id,
+                    client_label=event.client_label,
+                    expires_at=job.result.expires_at if job.result else None,
+                )
+            )
 
     # ------------------------------------------------------------------
     # Playback
@@ -713,6 +730,13 @@ class MainWindow(QMainWindow):
             f"{tr('CPU')} {usage.cpu_percent:.0f}%  ·  "
             f"{tr('Memory')} {memory_size(usage.rss_bytes)}"
         )
+
+    def _post(self, notice: Notice) -> None:
+        """Record a notice and show it.  Only notices go to the OS, and
+        only when the user turned that on -- F-70 and 4.1."""
+        self.notifications.post(notice)
+        kind = {Level.OK: "ok", Level.ERROR: "error"}.get(notice.level, "info")
+        self._show_notice(notice.title, notice.detail, kind=kind)
 
     def _show_notice(self, title: str, detail: str, *, kind: str = "info") -> None:
         p = self.palette_tokens
