@@ -32,7 +32,22 @@ class Code(StrEnum):
     FILE_PERMISSION = "FILE_PERMISSION"
     FILE_NOT_FOUND = "FILE_NOT_FOUND"
 
-    # -- request shape (F-54, F-49) --------------------------------------
+    # -- request shape (F-54, F-49, F-57) ---------------------------------
+    #: The body could not be read at all -- malformed JSON, a multipart
+    #: body whose parts do not parse.  Distinct from a body that parsed
+    #: and then failed validation, because a client can act on the
+    #: difference: one is a bug in how it encoded the request, the other
+    #: is a wrong value in it.
+    MALFORMED_REQUEST = "MALFORMED_REQUEST"
+    #: A field this version does not define.  F-54 forbids substituting an
+    #: unknown option, and silently dropping one is a substitution the
+    #: caller cannot see.
+    UNKNOWN_OPTION = "UNKNOWN_OPTION"
+    #: The same fault inside the voice settings, which Section 2.10 gives a
+    #: different status.  A separate code rather than an override on the
+    #: one above: the status is part of what a code means here, and a
+    #: per-call escape hatch would make that stop being true.
+    VOICE_SETTINGS_INVALID = "VOICE_SETTINGS_INVALID"
     JOB_KIND_MISSING = "JOB_KIND_MISSING"
     JOB_KIND_UNKNOWN = "JOB_KIND_UNKNOWN"
     IDEMPOTENCY_KEY_MISSING = "IDEMPOTENCY_KEY_MISSING"
@@ -121,6 +136,9 @@ _CATALOGUE: dict[Code, tuple[int, bool, str]] = {
     Code.FILE_ENCRYPTED: (415, False, "The file is encrypted."),
     Code.FILE_PERMISSION: (403, False, "The file cannot be read with the current permissions."),
     Code.FILE_NOT_FOUND: (404, False, "The file no longer exists."),
+    Code.MALFORMED_REQUEST: (400, False, "The request body could not be read."),
+    Code.UNKNOWN_OPTION: (400, False, "The request names a field this version does not define."),
+    Code.VOICE_SETTINGS_INVALID: (422, False, "The voice settings are not valid."),
     Code.JOB_KIND_MISSING: (400, False, "The request must state a job kind."),
     Code.JOB_KIND_UNKNOWN: (400, False, "That job kind is not supported by this version."),
     Code.IDEMPOTENCY_KEY_MISSING: (400, False, "A duplicate-prevention key is required."),

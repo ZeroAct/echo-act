@@ -120,6 +120,18 @@ BOUNDED_WAIT_DEFAULT_S: Final = 10.0
 BOUNDED_WAIT_CEILING_S: Final = 60.0
 
 # --------------------------------------------------------------- limits ---
+#: What a caller is told to wait for a result that is not finished yet.
+#: Section 4 fixes no figure, so this borrows the busy hint rather than
+#: introducing a second unexplained number.
+NOT_READY_RETRY_AFTER_S: Final = 3.0
+
+# F-74's scheduled backup: once daily, made up only once when missed.
+SCHEDULED_BACKUP_INTERVAL_S: Final = 86_400.0
+#: How long a failed scheduled backup waits before trying again.  Not a
+#: requirement; without it a frequent tick would retry a failing backup
+#: continuously, which N-28 would not forgive.
+SCHEDULED_BACKUP_RETRY_S: Final = 3_600.0
+
 RATE_GENERATION_PER_MIN: Final = 10  # 4.1, per client
 RATE_OTHER_PER_MIN: Final = 120
 AUTH_FAILURES_PER_MIN: Final = 10
