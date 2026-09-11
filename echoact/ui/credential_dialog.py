@@ -34,7 +34,7 @@ from PySide6.QtWidgets import (
 
 from . import icons
 from .i18n import add_korean, tr
-from .theme import METRICS, Palette, mono_font
+from .theme import METRICS, Palette
 
 add_korean(
     {
@@ -88,7 +88,7 @@ class CredentialDialog(QDialog):
         # keyboard, and N-30 wants the basic features usable without a mouse.
         self.value = QPlainTextEdit(self._token)
         self.value.setReadOnly(True)
-        self.value.setFont(mono_font(METRICS.size_body))
+        self.value.setProperty("mono", True)
         self.value.setFixedHeight(64)
         self.value.setAccessibleName(tr("Credential"))
         outer.addWidget(self.value)

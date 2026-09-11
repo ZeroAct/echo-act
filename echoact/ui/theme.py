@@ -187,7 +187,10 @@ _FALLBACKS = (
     "Segoe UI",
     "Helvetica Neue",
 )
-_MONO_FALLBACKS = ("JetBrains Mono", "Cascadia Mono", "Consolas", "SF Mono", "Menlo")
+# Consolas before Cascadia Mono on purpose: on a Korean-locale Windows
+# the latter draws U+005C as the won sign, and a path or a JSON escape
+# shown that way reads as a mistake in something the user is copying.
+_MONO_FALLBACKS = ("JetBrains Mono", "Consolas", "Cascadia Mono", "SF Mono", "Menlo")
 
 
 def resolve_family(candidates: tuple[str, ...] = _FALLBACKS) -> str:
@@ -264,6 +267,7 @@ def stylesheet(p: Palette, m: Metrics = METRICS, family: str | None = None) -> s
     theme and the check simply vanishes.
     """
     fam = family or resolve_family()
+    mono = resolve_family(_MONO_FALLBACKS)
     key = "dark" if p.is_dark else "light"
     a = icons.stylesheet_assets(
         key,
@@ -292,6 +296,15 @@ QWidget#Panel, QFrame#Panel {{
     background: {p.surface};
     border: 1px solid {p.border};
     border-radius: {m.radius}px;
+}}
+
+/* A monospaced face, as a property rather than a call.
+   The `*` rule above sets font-family on every widget and a stylesheet
+   beats setFont, so a code block or a path asked for in Python quietly
+   renders in the interface face -- which on a Korean-locale Windows
+   draws U+005C as the won sign, turning every path into currency. */
+*[mono="true"] {{
+    font-family: "{mono}";
 }}
 
 QLabel[role="title"] {{

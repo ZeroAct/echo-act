@@ -287,6 +287,16 @@ def _document(p: QPainterPath) -> None:
     p.lineTo(18.5, 8)
 
 
+def _pulse(p: QPainterPath) -> None:
+    """Activity: a heartbeat line, which reads at 16 px where a gauge does not."""
+    p.moveTo(3, 12)
+    p.lineTo(8, 12)
+    p.lineTo(10.5, 6)
+    p.lineTo(13.5, 18)
+    p.lineTo(16, 12)
+    p.lineTo(21, 12)
+
+
 def _more(p: QPainterPath) -> None:
     for x in (7.0, 12.0, 17.0):
         p.addEllipse(QPointF(x, 12), 0.9, 0.9)
@@ -318,7 +328,8 @@ _ICONS: dict[str, tuple[Callable[[QPainterPath], None], bool, str]] = {
     "settings": (_settings, False, "Settings"),
     "library": (_library, False, "Library"),
     "cube": (_cube, False, "Models"),
-    "plug": (_plug, False, "Integrations"),
+    "plug": (_plug, False, "Connect an app"),
+    "pulse": (_pulse, False, "Activity"),
     "volume": (_volume, False, "Volume"),
     "volume-muted": (_volume_muted, False, "Muted"),
     "locate": (_locate, False, "Return to the reading position"),

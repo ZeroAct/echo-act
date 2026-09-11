@@ -39,7 +39,7 @@ def window(tmp_path, monkeypatch, qt):
     finally:
         w._tick.stop()
         w.bridge.detach()
-        for name in ("_library", "_models", "_settings_screen", "_status"):
+        for name in ("_library", "_models", "_settings_screen", "_status", "_connect"):
             dialog = getattr(w, name, None)
             if dialog is not None:
                 dialog.close()
@@ -54,6 +54,7 @@ def window(tmp_path, monkeypatch, qt):
         ("models", "_models"),
         ("settings", "_settings_screen"),
         ("status", "_status"),
+        ("connect", "_connect"),
     ],
 )
 def test_a_header_button_opens_its_screen(window, button: str, attribute: str) -> None:

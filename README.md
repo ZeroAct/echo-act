@@ -58,6 +58,13 @@ MCP client starts, which talks to the local service over loopback with a
 credential you issue for it. It adds nothing the HTTP service does not already
 do, and its permissions are exactly that credential's.
 
+**Connect an app** in the header writes the configuration for you: a tab each
+for Claude Desktop, Claude Code, Codex CLI, VS Code and Cursor, with the right
+key name and file path for each, the command this particular installation
+actually uses, and a Copy button. Issue a credential from that screen and it
+goes straight into the snippet — the only moment it can, since the app keeps
+only a verifier.
+
 Tools: `list_models`, `estimate_speech`, `create_speech`, `get_speech_job`,
 `cancel_speech_job`, `list_speech_segments`, `get_speech_result`,
 `list_speech_history`.

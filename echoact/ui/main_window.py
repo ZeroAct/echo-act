@@ -83,6 +83,7 @@ add_korean(
         "Following paused": "따라가기 일시 중지됨",
         "Open a text file": "텍스트 파일 열기",
         "Activity": "활동",
+        "Connect an app": "앱 연결",
         "Storage": "저장 공간",
         "{n} items cleaned up": "{n}개 항목을 정리했습니다",
         "Some items could not be deleted": "일부 항목을 삭제하지 못했습니다",
@@ -181,7 +182,8 @@ class MainWindow(QMainWindow):
         for key, name, glyph in (
             ("library", tr("Library"), "library"),
             ("models", tr("Models"), "cube"),
-            ("status", tr("Activity"), "plug"),
+            ("connect", tr("Connect an app"), "plug"),
+            ("status", tr("Activity"), "pulse"),
             ("settings", tr("Settings"), "settings"),
         ):
             b = QPushButton("  " + name)
@@ -311,6 +313,7 @@ class MainWindow(QMainWindow):
         self.nav["models"].clicked.connect(self._show_models)
         self.nav["settings"].clicked.connect(self._show_settings)
         self.nav["status"].clicked.connect(self._show_status)
+        self.nav["connect"].clicked.connect(self._show_connect)
 
         self.open_button.clicked.connect(self._open_file)
         self.save_button.clicked.connect(self._save_audio)
@@ -929,6 +932,55 @@ class MainWindow(QMainWindow):
         screen.set_released_version(
             None, error=tr("EchoAct cannot check for a newer version in this build.")
         )
+
+    def _show_connect(self) -> None:
+        """F-58: the app hands the user what their MCP client needs.
+
+        Reachable from the header rather than buried in Settings,
+        because it is the first thing someone wanting an integration
+        looks for and the values are not guessable: the ``--mcp`` flag,
+        the two environment variables, and a different key name in every
+        client's configuration file.
+        """
+        from .mcp_setup import McpSetupView
+
+        settings = self.app.settings
+        screen = McpSetupView(
+            self.palette_tokens,
+            port=settings.rest_port,
+            mcp_enabled=settings.mcp_enabled,
+            rest_enabled=settings.rest_enabled,
+            credentials=[c for c in self.app.credentials.list() if not c.is_owner],
+        )
+        screen.credential_requested.connect(
+            lambda name: self._issue_for_client(screen, name)
+        )
+        screen.open_settings_requested.connect(self._show_settings)
+        self._connect = self._open_screen(
+            tr("Connect an app"), screen, width=880, height=760
+        )
+
+    def _issue_for_client(self, screen: QWidget, name: str) -> None:
+        """Mint a credential and put it straight into the snippet.
+
+        F-71 shows a credential once, so this is the only moment the
+        value can be written into a configuration block. It is given
+        generate and read-results and nothing else: F-61 authorises
+        history separately, and a setup screen is the wrong place to
+        hand out more than the client asked for.
+        """
+        from ..domain import Capability
+
+        try:
+            issued = self.app.credentials.issue(
+                name=name,
+                capabilities={Capability.GENERATE, Capability.READ_RESULTS},
+                days=self.app.settings.credential_days,
+            )
+        except EchoActError as exc:
+            self._show_problem(exc)
+            return
+        screen.set_token(issued.token)
 
     def _show_status(self) -> None:
         from .status_view import StatusView
