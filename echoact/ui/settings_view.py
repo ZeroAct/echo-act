@@ -91,6 +91,7 @@ from ..policy import (
 )
 from ..security.credentials import Credential, CredentialStatus
 from . import icons
+from .controls import guard_wheel
 from .i18n import add_korean, bytes_size, memory_size, on_change, tr
 from .theme import METRICS, Palette
 
@@ -627,6 +628,20 @@ class SettingsView(QScrollArea):
         column.addWidget(self._build_about())
         column.addStretch(1)
         self.setWidget(self.content)
+
+        # Every control with a value the wheel would change, now that they
+        # all exist.  This screen is one long scroll, so without it reading
+        # down the page edits the settings being read (N-30).
+        guard_wheel(
+            self.cpu,
+            self.memory,
+            self.device,
+            self.volume,
+            self.language,
+            self.port,
+            self.credential_days,
+            self.retention,
+        )
 
         self.apply(settings)
         self.refresh_devices()

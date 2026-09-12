@@ -9,8 +9,10 @@ than mostly true.
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QEvent, QObject, Qt, Signal
 from PySide6.QtWidgets import (
+    QAbstractScrollArea,
+    QApplication,
     QCheckBox,
     QComboBox,
     QFrame,
@@ -58,6 +60,62 @@ def separator() -> QFrame:
     f.setFrameShape(QFrame.Shape.HLine)
     f.setFixedHeight(1)
     return f
+
+
+class _WheelGuard(QObject):
+    """Sends the wheel to the page instead of into the value.
+
+    Qt gives a wheel event to the widget under the pointer, so a spin box,
+    a combo box, or a slider inside a scrolling panel eats the scroll and
+    changes its own value -- which is how someone reading down the settings
+    screen silently sets their processor share to 45%.  N-30 wants the panel
+    reachable by scrolling, and a control that swallows the gesture takes
+    that away twice: the page does not move and something was changed.
+
+    Deliberately not "never respond to the wheel": once the control has
+    focus the gesture is aimed at it, and adjusting a focused spin box by
+    wheel is the behaviour of every other desktop app.  Keyboard operation
+    is untouched either way.
+    """
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802 - Qt override
+        if event.type() is not QEvent.Type.Wheel:
+            return False
+        widget = watched if isinstance(watched, QWidget) else None
+        if widget is None or widget.hasFocus():
+            return False
+        area = _scroll_area(widget)
+        if area is None:
+            return False
+        # Hand the same event to the panel's viewport.  The filter is
+        # installed on value controls only, never on a viewport, so this
+        # cannot come back round.
+        QApplication.sendEvent(area.viewport(), event)
+        return True
+
+
+_WHEEL_GUARD = _WheelGuard()
+
+
+def _scroll_area(widget: QWidget) -> QAbstractScrollArea | None:
+    parent = widget.parentWidget()
+    while parent is not None:
+        if isinstance(parent, QAbstractScrollArea):
+            return parent
+        parent = parent.parentWidget()
+    return None
+
+
+def guard_wheel(*widgets: QWidget) -> None:
+    """Keep these controls from eating the page's scroll.
+
+    Called after a panel is built, with the controls that have a value a
+    wheel would change.  One shared filter object rather than one per
+    widget: it holds no state.
+    """
+    for widget in widgets:
+        widget.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        widget.installEventFilter(_WHEEL_GUARD)
 
 
 def tool_button(name: str, palette: Palette, *, size: int = 18) -> QToolButton:
