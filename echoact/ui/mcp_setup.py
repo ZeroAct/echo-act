@@ -84,8 +84,8 @@ add_korean(
         "rather than a fault in the app.":
             "각 클라이언트의 공개된 형식을 따릅니다. 아직 실제 클라이언트에서 검증하지 않았으므로, "
             "연결되지 않으면 앱의 결함이 아니라 설정 문제로 보고 확인하세요.",
-        "Protocol revision {revision}. Eight tools, stdio only.":
-            "프로토콜 개정판 {revision}. 도구 8개, stdio 전용.",
+        "Protocol revision {revision}. Ten tools, stdio only.":
+            "프로토콜 개정판 {revision}. 도구 10개, stdio 전용.",
         "No credential yet": "아직 자격 증명 없음",
     }
 )
@@ -391,7 +391,7 @@ class McpSetupView(QWidget):
         outer.addWidget(footer)
 
         revision = QLabel(
-            tr("Protocol revision {revision}. Eight tools, stdio only.").format(
+            tr("Protocol revision {revision}. Ten tools, stdio only.").format(
                 revision=MCP_PROTOCOL_REVISION
             )
         )

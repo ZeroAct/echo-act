@@ -1,4 +1,4 @@
-"""Section 2.10's twelve operations.  Twelve, and no thirteenth.
+"""Section 2.10's thirteen operations, and no fourteenth.
 
 The contract table is the public functional surface, so this module registers
 exactly the paths it lists.  Anything a client might also find useful --
@@ -48,6 +48,7 @@ from starlette.responses import StreamingResponse
 
 from ..audio import wav
 from ..config.budget import resolve_budget_from_system
+from ..config.settings import default_voice
 from ..db.store import JobSummary
 from ..domain import (
     Budget,
@@ -114,6 +115,7 @@ from .schemas import (
     MinimumBudgetOut,
     ModelOut,
     ModelsOut,
+    PlaybackOut,
     ResourcePolicyOut,
     ResultOut,
     SegmentOut,
@@ -137,7 +139,7 @@ _AUDIO_HEADERS = {"Cache-Control": "private, no-store", "Accept-Ranges": "none"}
 
 
 def build_router(context: ServiceContext) -> APIRouter:
-    """Register the twelve operations against one service context."""
+    """Register the contract's operations against one service context."""
     router = APIRouter()
 
     # ==================================================================
@@ -194,6 +196,7 @@ def build_router(context: ServiceContext) -> APIRouter:
                 history=credential.has_capability(Capability.READ_HISTORY),
                 results=credential.has_capability(Capability.READ_RESULTS),
                 generation=credential.has_capability(Capability.GENERATE),
+                external_play=bool(settings.external_play),
             ),
             resource_policy=ResourcePolicyOut(
                 max_input_codepoints=MAX_INPUT_CODEPOINTS,
@@ -315,7 +318,7 @@ def build_router(context: ServiceContext) -> APIRouter:
         refusal.
         """
         require_capability(context, request, Capability.GENERATE)
-        settings = _voice_settings(body.voice)
+        settings = _voice_settings(body.voice, context.manifest)
         report = estimate(
             body.text,
             settings,
@@ -500,6 +503,41 @@ def build_router(context: ServiceContext) -> APIRouter:
             pass
         response.status_code = 202
         return _job_out(context, _reload(context, job_id))
+
+    # ==================================================================
+    # F-89 -- play on the host output device
+    # ==================================================================
+
+    @router.post(
+        "/jobs/{job_id}/play",
+        response_model=JobOut,
+        status_code=202,
+        summary="Ask for the job's audio to be played on the host output device",
+        responses={
+            202: {"description": "Accepted. Playback starts at the first ready segment."},
+            403: {"description": "The owner has not allowed clients to play out loud (F-89)."},
+            409: {"description": "The owner is listening to something else; retry-after given."},
+        },
+    )
+    def post_play(request: Request, job_id: str) -> JobOut:
+        """F-89, and the reason it is a request rather than a command.
+
+        Nothing here reaches the speaker.  The decision -- allowed at all,
+        and not while the owner is listening -- is made synchronously so this
+        can answer 403 or 409, and the playing itself is left to the window,
+        which owns the player and the notice.  A job still generating is a
+        legitimate target: F-12's rule is that playback starts at the first
+        ready segment and follows the work, and F-89 keeps that for an
+        external request too.
+        """
+        _, job = require_job(context, request, job_id, Capability.GENERATE, include_segments=True)
+        _require_playable(job)
+        context.play_requests.request(job_id, client_label=job.client_label)
+        return _job_out(
+            context,
+            job,
+            playback=PlaybackOut(accepted=True),
+        )
 
     # ==================================================================
     # F-55 -- segments
@@ -772,7 +810,7 @@ def _create_job(
     """
     credential = require_capability(context, request, Capability.GENERATE)
     text = _resolve_input(body, upload, filename)
-    settings = _voice_settings(body.voice)
+    settings = _voice_settings(body.voice, context.manifest)
 
     wait_s = clamp_wait(body.wait_s, ceiling_s=context.bounded_wait_ceiling_s)
     # F-88: never wait while a model is being prepared or downloaded.  Asked
@@ -796,6 +834,10 @@ def _create_job(
         wait_s=wait_s or None,
     )
     job, created = context.engine.submit(job_request)
+    # Before the wait, not after it.  F-89 starts playback at the first ready
+    # segment and follows generation, so a caller that asked to wait ten
+    # seconds must not be waiting in silence for audio that is already there.
+    playback = _ask_to_play(context, job) if body.play else None
 
     waited_s = 0.0
     if created and wait_s > 0 and not would_load:
@@ -811,7 +853,55 @@ def _create_job(
         response.status_code = 200
     else:
         response.status_code = 202
-    return _job_out(context, job, waited_s=waited_s, duplicate=not created)
+    return _job_out(
+        context,
+        job,
+        waited_s=waited_s,
+        duplicate=not created,
+        playback=playback,
+    )
+
+
+def _ask_to_play(context: ServiceContext, job: Job) -> PlaybackOut:
+    """F-89 alongside F-54's creation, without letting one break the other.
+
+    The job exists by the time this runs, so a refused speaker cannot be
+    allowed to fail the response: the caller would have a job it was told
+    nothing about, and F-49 would hand it the same job again on the retry
+    its error invited.  So the refusal is carried as data, with the code the
+    dedicated endpoint would have used.
+    """
+    try:
+        _require_playable(job)
+        context.play_requests.request(job.job_id, client_label=job.client_label)
+    except EchoActError as exc:
+        return PlaybackOut(
+            accepted=False,
+            code=exc.code.value,
+            message=exc.message,
+            retry_after_s=exc.retry_after_s,
+        )
+    return PlaybackOut(accepted=True)
+
+
+def _require_playable(job: Job) -> None:
+    """Refuse a job that has no audio and never will have any.
+
+    F-55 forbids presenting an ungenerated result as a finished one, and a
+    play request for a failed or cancelled job that produced nothing is that
+    same mistake with a speaker attached.  A job still working is fine:
+    playback follows generation.
+    """
+    if not job.state.is_terminal:
+        return
+    if job.result is not None and not _expired(job.result):
+        return
+    if any(segment.ready and segment.audio_path for segment in job.segments):
+        return
+    detail = {"job_id": job.job_id, "state": job.state.value}
+    if job.result is not None:
+        raise EchoActError(Code.RESULT_EXPIRED, detail=detail)
+    raise EchoActError(Code.RESULT_MISSING, "That job produced no audio to play.", detail=detail)
 
 
 def _resolve_input(
@@ -846,15 +936,46 @@ def _resolve_input(
 # ======================================================================
 
 
-def _voice_settings(voice: Any) -> VoiceSettings:
+def _voice_settings(voice: Any, manifest: Any) -> VoiceSettings:
+    """F-54: what the caller asked for, with the manifest's defaults filling in.
+
+    The defaults come from ``config.settings.default_voice``, which is built
+    from the manifest constants and not from the owner's stored settings --
+    the distinction F-54 now states, and the reason this does not simply read
+    ``context.settings.voice``.  An omitted gender is read off the named
+    voice instead: a caller that said ``M1`` has already chosen, and
+    defaulting the gender there would answer VOICE_GENDER_MISMATCH to a
+    request that contradicted nothing.
+    """
+    base = default_voice()
+    if voice is None:
+        return base
+    voice_id = voice.voice_id or base.voice_id
+    gender = voice.gender
+    if gender is None:
+        gender = _gender_of(manifest, voice.model_id or base.model_id, voice_id, base.gender)
     return VoiceSettings(
-        model_id=voice.model_id,
+        model_id=voice.model_id or base.model_id,
         language=voice.language,
-        gender=voice.gender,
-        voice_id=voice.voice_id,
+        gender=gender,
+        voice_id=voice_id,
         style=voice.style,
         tempo=voice.tempo,
     )
+
+
+def _gender_of(manifest: Any, model_id: str, voice_id: str, fallback: Gender) -> Gender:
+    """The named voice's own gender, or the default when it cannot be looked up.
+
+    A lookup failure is not answered here.  An unknown model or voice is
+    still a refusal, but it belongs to ``validate_request``, which reports it
+    with the code and detail F-57 requires; guessing a different code from
+    inside a projection would give the same mistake two vocabularies.
+    """
+    try:
+        return manifest.get(model_id).voice(voice_id).gender
+    except EchoActError:
+        return fallback
 
 
 def _voice_out(settings: VoiceSettings) -> VoiceOut:
@@ -898,6 +1019,7 @@ def _job_out(
     *,
     waited_s: float | None = None,
     duplicate: bool | None = None,
+    playback: PlaybackOut | None = None,
 ) -> JobOut:
     result = job.result
     expired = _expired(result) if result is not None else False
@@ -927,6 +1049,7 @@ def _job_out(
         error=_job_error(job.error_code, job.error_message),
         waited_s=waited_s,
         duplicate=duplicate,
+        playback=playback,
     )
 
 

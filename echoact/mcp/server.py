@@ -1,4 +1,4 @@
-"""The MCP server: eight tools, each one REST call, and nothing else.
+"""The MCP server: ten tools, each one REST call, and nothing else.
 
 F-59 is unusually strict about this and it is worth restating, because the
 temptation to be helpful here is what would break it: each tool maps onto
@@ -40,7 +40,11 @@ import sys
 from typing import Annotated, Any
 
 from ..errors import Code, EchoActError
-from ..policy import BOUNDED_WAIT_CEILING_S, MCP_PROTOCOL_REVISION
+from ..policy import (
+    BOUNDED_WAIT_CEILING_S,
+    BOUNDED_WAIT_DEFAULT_S,
+    MCP_PROTOCOL_REVISION,
+)
 from ..util import ids
 from .client import RestClient, describe
 from .config import Connection
@@ -49,18 +53,32 @@ SERVER_NAME = "echoact"
 RESOURCE_SCHEME = "echoact"
 
 INSTRUCTIONS = """\
-EchoAct generates Korean and English speech locally, on this machine.
+EchoAct generates Korean and English speech locally, on this machine, and
+can play it on this machine's speakers.
+
+Use `speak` when the person wants to hear something: "speak", "say that",
+"say it out loud", "read this aloud", "read it to me", "out loud", "aloud",
+"voice this", and in Korean "말해줘", "읽어줘", "소리내어 읽어줘",
+"음성으로 들려줘", "읽어주세요". One call generates the audio and plays
+it here; no file handling and no second call are needed.
+
+Use `create_speech` instead when the audio is wanted as data rather than as
+sound, and `play_speech` to play a job that already exists.
+
+`speak` and `create_speech` need an idempotency_key. Reuse the same key when
+you retry and you will get the same job back rather than a second rendering.
+Voice settings are optional: omit them and EchoAct uses its own default
+voice rather than whatever the person last selected on screen.
 
 One generation runs at a time across the whole application, including the
 person sitting at it, so contention is normal: a busy answer carries a
-retry_after_s and giving up is a reasonable response to it.
+retry_after_s and giving up is a reasonable response to it. Playing is
+refused the same way while that person is listening to something else, and
+they can turn playing off altogether.
 
-Call estimate_speech before create_speech for anything long: it validates,
-counts segments, gives the expected length, and says whether the slot is
-free, without creating a job or loading a model.
-
-create_speech needs an idempotency_key. Reuse the same key when you retry
-and you will get the same job back rather than a second rendering.
+Call estimate_speech before generating anything long: it validates, counts
+segments, gives the expected length, and says whether the slot is free,
+without creating a job or loading a model.
 """
 
 
@@ -171,12 +189,22 @@ def build(connection: Connection, *, client: RestClient | None = None):
             "The job is untouched either way; if the bound passes you get the job id.",
         ] = None,
         retain: Annotated[bool, "Keep the result in EchoAct's library."] = False,
+        play: Annotated[
+            bool,
+            "Play the audio on this machine's speakers as it is generated. "
+            "Use the speak tool instead if playing is the point.",
+        ] = False,
     ) -> dict[str, Any]:
-        """Start generating speech.
+        """Start generating speech, as data.
 
         Returns the job's state.  If it finished inside ``wait_seconds``
         the answer is terminal; otherwise it carries the job id and the
         job continues untouched.  Waiting never covers model preparation.
+
+        With ``play`` the audio is also played here (F-89).  The job is
+        created either way: a refused speaker is reported in ``playback``
+        rather than as a failure, because the audio still exists and can
+        be fetched.
 
         File and URL inputs are not accepted: N-18 keeps arbitrary paths
         and external URLs out of what an integration can ask EchoAct to
@@ -187,11 +215,83 @@ def build(connection: Connection, *, client: RestClient | None = None):
             "idempotency_key": idempotency_key,
             "text": text,
             "retain": retain,
+            "play": play,
             "voice": _voice_body(model_id, voice_id, gender, language, style, tempo),
         }
         if wait_seconds is not None:
             body["wait_s"] = max(0.0, min(float(wait_seconds), BOUNDED_WAIT_CEILING_S))
         return call(lambda: rest.post("/jobs", body))
+
+    @mcp.tool
+    def speak(
+        text: Annotated[str, "What to say. Files and URLs are not accepted."],
+        idempotency_key: Annotated[
+            str, "Required. Reuse it on a retry so one sentence is not spoken twice."
+        ],
+        model_id: Annotated[str | None, "From list_models. Omit for EchoAct's default."] = None,
+        voice_id: Annotated[str | None, "From list_models. Omit for EchoAct's default."] = None,
+        gender: Annotated[
+            str | None, "female or male. Omit to take the named voice's own."
+        ] = None,
+        language: Annotated[str | None, "auto, ko or en. Omit for auto."] = None,
+        style: Annotated[
+            str | None, "natural, calm, bright or narration. Omit for natural."
+        ] = None,
+        tempo: Annotated[float | None, "0.70 to 1.50. Omit for 1.0."] = None,
+        wait_seconds: Annotated[
+            float | None,
+            "Wait up to this long for the speaking to finish before answering. "
+            "Sound starts at the first ready sentence regardless.",
+        ] = BOUNDED_WAIT_DEFAULT_S,
+    ) -> dict[str, Any]:
+        """Say something out loud on this machine, in one call.
+
+        This is the tool for "speak", "say it out loud", "read this aloud",
+        and their Korean equivalents.  Playback starts at the first ready
+        sentence and follows the rest, so a short line is heard at once.
+
+        One REST call, exactly as ``create_speech`` with ``play`` is: F-59
+        allows a tool no capability REST does not already have, so what is
+        different here is the defaults and the name, not the behaviour.
+        Whether the sound actually started is in ``playback``; a job whose
+        ``playback.accepted`` is false was still generated and can be
+        fetched with get_speech_result.
+        """
+        body: dict[str, Any] = {
+            "kind": "speech",
+            "idempotency_key": idempotency_key,
+            "text": text,
+            "retain": False,
+            "play": True,
+        }
+        voice = {
+            "model_id": model_id,
+            "voice_id": voice_id,
+            "gender": gender,
+            "language": language,
+            "style": style,
+            "tempo": tempo,
+        }
+        stated = {k: v for k, v in voice.items() if v is not None}
+        if stated:
+            # Only what the caller stated.  The rest is EchoAct's own
+            # default, which comes from the model manifest and not from the
+            # owner's current on-screen selection (F-54).
+            body["voice"] = stated
+        if wait_seconds is not None:
+            body["wait_s"] = max(0.0, min(float(wait_seconds), BOUNDED_WAIT_CEILING_S))
+        return call(lambda: rest.post("/jobs", body))
+
+    @mcp.tool
+    def play_speech(job_id: Annotated[str, "From create_speech or speak."]) -> dict[str, Any]:
+        """Play one of your own jobs on this machine's speakers.
+
+        For a job that already exists; ``speak`` is the one call that does
+        both.  Playing is refused while the person at the machine is
+        listening to something else, and refused permanently if they have
+        turned playing by an app off -- the error says which.
+        """
+        return call(lambda: rest.post(f"/jobs/{job_id}/play"))
 
     @mcp.tool
     def get_speech_job(job_id: Annotated[str, "From create_speech."]) -> dict[str, Any]:
@@ -330,6 +430,15 @@ def preflight(rest: RestClient) -> dict[str, Any]:
             Code.MCP_DISABLED,
             "MCP is turned off in EchoAct. Enable it under Settings; "
             "this server cannot enable it.",
+        )
+    capabilities = status.get("capabilities") or {}
+    if capabilities.get("external_play") is False:
+        # Not a refusal: every other tool works, and speak still generates.
+        # Said once here rather than on each call, for the same reason the
+        # rest of this function exists.
+        _stderr(
+            "EchoAct is not set to play out loud; speak will generate audio but "
+            "nothing will be heard until the owner turns that on under Settings."
         )
     revision = status.get("mcp_protocol_revision")
     if revision and revision != MCP_PROTOCOL_REVISION:

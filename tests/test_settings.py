@@ -82,7 +82,8 @@ def test_defaults_match_the_documented_first_launch_policy() -> None:
     assert s.follow is FOLLOW_DEFAULT is True
     assert (s.volume, s.muted, s.output_device) == (1.0, False, None)
     assert s.os_notifications is False
-    assert (s.rest_enabled, s.rest_port, s.mcp_enabled) == (True, REST_PORT_DEFAULT, False)
+    assert (s.rest_enabled, s.rest_port, s.mcp_enabled) == (True, REST_PORT_DEFAULT, True)
+    assert s.external_play is True  # F-89
     assert s.credential_days == CREDENTIAL_DAYS_DEFAULT
     assert s.autosave_documents is False
     assert s.retain_history is False
@@ -108,7 +109,8 @@ def test_every_remembered_setting_survives_a_save_and_reload() -> None:
         os_notifications=True,
         rest_enabled=False,
         rest_port=9100,
-        mcp_enabled=True,
+        mcp_enabled=False,
+        external_play=False,
         credential_days=30,
         autosave_documents=True,
         retain_history=True,

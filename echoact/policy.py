@@ -157,7 +157,7 @@ BACKUP_RESTORE_MAX_ITEMS: Final = 100_000
 REST_HOST: Final = "127.0.0.1"  # N-17: loopback only, not configurable
 REST_PORT_DEFAULT: Final = 8765
 REST_ENABLED_DEFAULT: Final = True  # F-46
-MCP_ENABLED_DEFAULT: Final = False  # F-46
+MCP_ENABLED_DEFAULT: Final = True  # F-46
 
 CREDENTIAL_DAYS_DEFAULT: Final = 90  # 4.1
 CREDENTIAL_DAYS_MIN: Final = 1
@@ -180,6 +180,11 @@ VOICE_PRESET_MAX: Final = 100  # 4.1
 PLAYBACK_VOLUME_DEFAULT: Final = 1.0
 OS_NOTIFICATIONS_DEFAULT: Final = False
 AUTOPLAY_DEFAULT: Final = True  # F-83
+EXTERNAL_PLAY_DEFAULT: Final = True  # F-89
+# F-57 wants a hint a client can honour rather than guess at.  The figure is
+# the owner's attention span rather than a measurement: whatever they are
+# playing, asking again in a few seconds is the useful interval.
+PLAYBACK_BUSY_RETRY_AFTER_S: Final = 5.0  # F-89
 FOLLOW_DEFAULT: Final = True  # F-30
 AUTOSAVE_DOCUMENTS_DEFAULT: Final = False  # 4.1
 RETAIN_HISTORY_DEFAULT: Final = False  # 4.1

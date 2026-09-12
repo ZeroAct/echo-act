@@ -62,6 +62,7 @@ from ..policy import (
     CREDENTIAL_DAYS_DEFAULT,
     CREDENTIAL_DAYS_MAX,
     CREDENTIAL_DAYS_MIN,
+    EXTERNAL_PLAY_DEFAULT,
     FOLLOW_DEFAULT,
     MCP_ENABLED_DEFAULT,
     MEMORY_CEILING_BYTES,
@@ -187,7 +188,7 @@ class VoicePreset:
             raise TypeError("a preset's voice must be a table")
         return cls(
             name=str(d["name"]),
-            voice=_read_voice(voice, _default_voice(), [] if problems is None else problems),
+            voice=_read_voice(voice, default_voice(), [] if problems is None else problems),
         )
 
 
@@ -237,7 +238,13 @@ def _default_display_language() -> DisplayLanguage:
     return os_display_language()
 
 
-def _default_voice() -> VoiceSettings:
+def default_voice() -> VoiceSettings:
+    """The settings a request takes when it names none (F-54).
+
+    Built from the manifest constants rather than from a stored ``Settings``,
+    so that an automated caller's output never depends on what the owner last
+    selected in the GUI.
+    """
     return VoiceSettings(
         model_id=DEFAULT_MODEL_ID,
         language=Language.AUTO,
@@ -258,7 +265,7 @@ class Settings:
     reference for too long.  ``with_`` returns a new instance instead.
     """
 
-    voice: VoiceSettings = field(default_factory=_default_voice)
+    voice: VoiceSettings = field(default_factory=default_voice)
 
     # -- resources (F-20, F-21) -------------------------------------------
     cpu_percent: int = CPU_PERCENT_DEFAULT
@@ -293,6 +300,10 @@ class Settings:
     rest_enabled: bool = REST_ENABLED_DEFAULT
     rest_port: int = REST_PORT_DEFAULT
     mcp_enabled: bool = MCP_ENABLED_DEFAULT
+    #: F-89.  An integration switch rather than a playback one, even though
+    #: it decides whether a speaker makes a sound: what it governs is what a
+    #: client may ask for, and F-46 is where the owner reviews that.
+    external_play: bool = EXTERNAL_PLAY_DEFAULT
     credential_days: int = CREDENTIAL_DAYS_DEFAULT
 
     # -- storage (4.1, F-42, F-44) ----------------------------------------
@@ -452,6 +463,7 @@ class Settings:
             "rest_enabled": self.rest_enabled,
             "rest_port": self.rest_port,
             "mcp_enabled": self.mcp_enabled,
+            "external_play": self.external_play,
             "credential_days": self.credential_days,
             "autosave_documents": self.autosave_documents,
             "retain_history": self.retain_history,
@@ -557,6 +569,9 @@ class Settings:
                 mcp_enabled=_read_bool(
                     d.get("mcp_enabled"), defaults.mcp_enabled, "mcp_enabled", problems
                 ),
+                external_play=_read_bool(
+                    d.get("external_play"), defaults.external_play, "external_play", problems
+                ),
                 credential_days=_read_int(
                     d.get("credential_days", defaults.credential_days),
                     default=defaults.credential_days,
@@ -620,6 +635,7 @@ _KNOWN_KEYS: Final[frozenset[str]] = frozenset(
         "rest_enabled",
         "rest_port",
         "mcp_enabled",
+        "external_play",
         "credential_days",
         "autosave_documents",
         "retain_history",
@@ -1237,6 +1253,7 @@ __all__ = [
     "SettingsModelPreferences",
     "SettingsStore",
     "VoicePreset",
+    "default_voice",
     "load_settings",
     "os_display_language",
     "output_device_key",

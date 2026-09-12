@@ -18,7 +18,23 @@ from .config import from_environment
 from .server import build, preflight
 
 
+def _pin_stderr() -> None:
+    """Diagnostics are UTF-8 whatever the console code page is.
+
+    The MCP client starts this process with pipes, so Python picks the
+    locale encoding -- cp949 on this machine -- and a Korean voice name or
+    client label in a diagnostic would raise inside the print rather than
+    be read.  The protocol's own streams are wrapped by the SDK; this is
+    the one stream left to us.
+    """
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError, ValueError):
+        pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    _pin_stderr()
     args = list(sys.argv[1:] if argv is None else argv)
     try:
         connection = from_environment(args)
