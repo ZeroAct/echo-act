@@ -1,4 +1,4 @@
-"""The local REST service: Section 2.10's twelve operations, and nothing else.
+"""The local REST service: Section 2.10's operations, and nothing else.
 
 Import order matters here only in that ``server`` pulls in uvicorn, which the
 GUI does not need until the owner actually starts the service; everything the

@@ -154,7 +154,7 @@ def http_exception_error(exc: StarletteHTTPException) -> EchoActError:
 
     An unknown path and an unsupported method both answer NOT_FOUND.  405
     would tell a caller that the path exists and only the verb is wrong, and
-    on a service whose whole contract is twelve fixed operations that is a
+    on a service whose whole contract is a dozen fixed operations that is a
     map of the surface for no benefit to a legitimate client.
     """
     if exc.status_code in (404, 405):

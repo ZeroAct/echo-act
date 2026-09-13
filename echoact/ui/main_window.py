@@ -45,8 +45,9 @@ from ..text.loader import load_file
 from ..util import ids
 from ..util.logging import get_logger
 from . import icons
-from .bridge import EngineBridge
+from .bridge import EngineBridge, PlayRequestBridge
 from .controls import TransportBar, VoicePanel, label, tool_button
+from .external_play import ExternalPlayback
 from .i18n import add_korean, approximate_duration, count, tr
 from .licence import LicenceDialog
 from .notifications import (
@@ -105,6 +106,10 @@ add_korean(
         "partial": "일부",
         "This file covers {percent}% of the text.": "이 파일은 본문의 {percent}%를 담고 있습니다.",
         "Line endings were normalised.": "줄바꿈 문자를 정규화했습니다.",
+        "Playing a request from {client}": "{client}의 요청을 재생하는 중",
+        "an app": "어떤 앱",
+        "Your text and reading position are untouched. Stop silences it.":
+            "입력한 본문과 읽는 위치는 그대로입니다. 정지를 누르면 소리가 멈춥니다.",
     }
 )
 
@@ -129,6 +134,7 @@ class MainWindow(QMainWindow):
         self._timeline: Timeline | None = None
         self._snapshot: str = ""
         self._started_playback = False
+        self._external_notice = False
         self._entry = MANIFEST.get(app.settings.voice.model_id)
 
         self._build()
@@ -293,6 +299,17 @@ class MainWindow(QMainWindow):
         self.bridge.segment_ready.connect(self._on_segment)
         self.bridge.finished.connect(self._on_finished)
 
+        # F-89.  The controller keeps its own timeline and never touches the
+        # reading surface, so both handlers see every segment event and each
+        # ignores the job that is not its own.
+        self.external = ExternalPlayback(self.app, self)
+        self.play_bridge = PlayRequestBridge(self.app.play_requests, self)
+        self.play_bridge.requested.connect(self.external.begin)
+        self.bridge.segment_ready.connect(self.external.on_segment)
+        self.bridge.finished.connect(self.external.on_finished)
+        self.external.changed.connect(self._on_external_changed)
+        self.external.failed.connect(self._show_problem)
+
         self.reading.length_changed.connect(self._on_length)
         self.reading.availability_changed.connect(self._on_availability)
         self.reading.following_changed.connect(self._on_following)
@@ -371,6 +388,7 @@ class MainWindow(QMainWindow):
             self._show_problem(exc)
             return
 
+        self.external.yield_to_owner()
         self._job_id = job.job_id
         self._snapshot = text
         self._started_playback = False
@@ -490,6 +508,8 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _play(self) -> None:
+        # F-50 and F-89: the owner reclaims the speaker by using it.
+        self.external.yield_to_owner()
         try:
             self.app.player.play()
         except EchoActError as exc:
@@ -500,6 +520,13 @@ class MainWindow(QMainWindow):
 
     def _toggle_play(self) -> None:
         player = self.app.player
+        if self.external.active:
+            # Space during an external request means "mine instead", not
+            # "pause theirs": pausing would leave the banner up over audio
+            # that had stopped.
+            self.external.yield_to_owner()
+            self._play()
+            return
         if player.state is PlayerState.PLAYING:
             player.pause()
             self.reading.set_paused()
@@ -508,11 +535,47 @@ class MainWindow(QMainWindow):
             self._play()
 
     def _stop(self) -> None:
-        """F-13: stopping playback does not stop generation."""
+        """F-13: stopping playback does not stop generation.
+
+        This is also F-89's one place to silence an external request, which
+        is why the button stays enabled while one is playing.
+        """
+        self.external.yield_to_owner()
         self.app.player.stop()
         self.reading.clear_highlight()
         self.transport.set_playback_state("", playing=False)
         self.transport.set_position(0)
+
+    def _on_external_changed(self) -> None:
+        """F-89's notice, and handing the player back afterwards.
+
+        The banner exists because audio starting on its own is otherwise
+        unexplainable, and it names the client for the same reason F-70
+        does.  What it does *not* do is move the reading position: the
+        highlight belongs to the text on screen, and F-89 leaves that alone.
+        """
+        if self.external.active:
+            client = self.external.client_label or tr("an app")
+            title = tr("Playing a request from {client}").format(client=client)
+            self._external_notice = True
+            self._show_notice(
+                title,
+                tr("Your text and reading position are untouched. Stop silences it."),
+            )
+            self._set_status(title)
+        else:
+            if self._external_notice:
+                self._external_notice = False
+                self.notice.hide()
+            if self._timeline is not None:
+                # Give the owner's own job the player back, so the transport
+                # is about their audio again rather than about audio that has
+                # stopped.
+                self.app.player.load(self._timeline)
+                self.transport.set_playable(self._timeline.duration_ms)
+            self.transport.set_playback_state("", playing=False)
+            self._set_status(tr("Ready to read") if self._job_id is None else "")
+        self._update_enabled()
 
     def _seek(self, ms: int) -> None:
         if not self.app.player.seek_ms(ms):
@@ -522,6 +585,13 @@ class MainWindow(QMainWindow):
 
     def _on_tick(self) -> None:
         player = self.app.player
+        self.external.poll()
+        if self.external.active:
+            # F-89: the position on the player belongs to text that is not on
+            # screen, so nothing here may move the mark or the scrubber.  The
+            # usage figures are still the window's to show (F-22).
+            self._refresh_usage()
+            return
         if self._timeline is None:
             return
         position = player.position_ms()
@@ -1091,8 +1161,9 @@ class MainWindow(QMainWindow):
         self.transport.set_generating(busy)
         self.voice_panel.set_locked(busy)
         playable = self._timeline is not None and self._timeline.total_frames > 0
-        self.transport.pause.setEnabled(playable)
-        self.transport.stop.setEnabled(playable)
+        self.transport.pause.setEnabled(playable or self.external.active)
+        # F-89 and F-69: silencing an external request is reachable here.
+        self.transport.stop.setEnabled(playable or self.external.active)
         self.save_button.setEnabled(playable)
         self.open_button.setEnabled(not busy)
 

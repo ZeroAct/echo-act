@@ -1,4 +1,4 @@
-"""Getting engine news onto the GUI thread.
+"""Getting engine and client news onto the GUI thread.
 
 The job engine runs a job on its own thread and calls listeners from there.
 Qt widgets may only be touched from the thread that created them, so every
@@ -16,6 +16,7 @@ from __future__ import annotations
 from PySide6.QtCore import QObject, Signal
 
 from ..jobs.engine import Event, EventKind, JobEngine
+from ..playrequests import PlayRequest, PlayRequests
 
 
 class EngineBridge(QObject):
@@ -45,6 +46,30 @@ class EngineBridge(QObject):
             self.segment_ready.emit(event)
         elif event.kind is EventKind.FINISHED:
             self.finished.emit(event)
+
+    def detach(self) -> None:
+        self._off()
+
+
+class PlayRequestBridge(QObject):
+    """The same hand-off for F-89's play requests.
+
+    A client's request arrives on a service worker thread; the player, the
+    transport, and the banner are the main thread's. So it crosses here,
+    beside the engine's events, because "news crossing a thread" belongs in
+    one file whatever the news is.
+    """
+
+    requested = Signal(object)
+
+    def __init__(self, requests: PlayRequests, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._requests = requests
+        self._off = requests.listen(self._on_request)
+
+    def _on_request(self, request: PlayRequest) -> None:
+        # Runs on the service thread; the emit is queued.
+        self.requested.emit(request)
 
     def detach(self) -> None:
         self._off()

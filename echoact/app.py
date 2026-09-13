@@ -34,6 +34,7 @@ from .jobs.engine import JobEngine, clear_temp_tree, expire_one_off_results
 from .models.catalog import MANIFEST
 from .models.registry import ModelRegistry
 from .paths import audio_dir, db_path, ensure_tree, temp_dir
+from .playrequests import PlayRequests
 from .security.credentials import CredentialStore, IssuedCredential
 from .security.ratelimit import RateLimiter
 from .util import ids
@@ -106,6 +107,10 @@ class Application:
             settings=self.settings,
         )
         self.player = Player()
+        # F-89: a client may ask for its job to be played here.  The gate
+        # needs the player to tell the owner's listening from its own, and
+        # the setting to know whether it may at all.
+        self.play_requests = PlayRequests(self.player, self.settings)
         self.scheduler = BackupScheduler()
         self.service: Any = None  # set by start_service, if it starts
 
@@ -213,6 +218,7 @@ class Application:
         self.settings = self.settings.with_(**changes)
         self.settings_store.save(self.settings)
         self.engine.apply_settings(self.settings)
+        self.play_requests.apply_settings(self.settings)
         self.store.set_retention_limit(self.settings.retention_bytes)
         return self.settings
 

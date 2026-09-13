@@ -116,6 +116,8 @@ class Code(StrEnum):
     # -- audio (F-67, F-68) ----------------------------------------------
     OUTPUT_DEVICE_LOST = "OUTPUT_DEVICE_LOST"
     OUTPUT_DEVICE_UNAVAILABLE = "OUTPUT_DEVICE_UNAVAILABLE"
+    PLAYBACK_NOT_ALLOWED = "PLAYBACK_NOT_ALLOWED"
+    PLAYBACK_BUSY = "PLAYBACK_BUSY"
 
     INTERNAL = "INTERNAL"
 
@@ -207,6 +209,15 @@ _CATALOGUE: dict[Code, tuple[int, bool, str]] = {
     Code.SHUTTING_DOWN: (503, False, "EchoAct is shutting down."),
     Code.OUTPUT_DEVICE_LOST: (503, True, "The audio output device disappeared."),
     Code.OUTPUT_DEVICE_UNAVAILABLE: (503, True, "No audio output device is available."),
+    # F-89: the owner turned external playback off, so no amount of waiting
+    # changes the answer -- which is why this one is not retryable and, by
+    # N-23, may not carry a hint.
+    Code.PLAYBACK_NOT_ALLOWED: (
+        403,
+        False,
+        "EchoAct is not set to play requests from an app out loud.",
+    ),
+    Code.PLAYBACK_BUSY: (409, True, "Someone is listening to something else right now."),
     Code.INTERNAL: (500, False, "An internal error occurred."),
 }
 

@@ -264,7 +264,7 @@ def test_the_screen_shows_everything_f69_lists_at_once(view, app):
     assert "CPUExecutionProvider" in view.model_providers.text()
     assert "CPU 41%" in view.usage_value.text()
     assert "8765" in view.rest_state.text()
-    assert view.mcp_state.text() in ("off", "꺼짐")
+    assert view.mcp_state.text() in ("on", "켜짐")
 
 
 def test_it_names_the_client_that_is_holding_the_slot(view, app):

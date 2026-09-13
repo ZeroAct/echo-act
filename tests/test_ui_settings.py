@@ -20,7 +20,8 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
-from PySide6.QtCore import QRect
+from PySide6.QtCore import QPoint, QPointF, QRect, Qt
+from PySide6.QtGui import QWheelEvent
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
     QApplication,
@@ -1305,3 +1306,63 @@ def test_every_string_the_screen_shows_has_a_korean_translation(view: SettingsVi
     finally:
         i18n.set_language(i18n.Lang.EN)
     assert missing == []
+
+
+# ======================================================================
+# N-30 -- scrolling the page rather than the values
+# ======================================================================
+
+
+def test_a_wheel_over_a_spin_box_scrolls_the_page_instead_of_changing_the_value(
+    app: QApplication,
+) -> None:
+    """Reading down a long settings page must not edit it on the way.
+
+    The screen is one scroll area, so Qt hands the wheel to whatever value
+    control is under the pointer. N-30 asks for the panel to stay reachable
+    by scrolling, and a spin box that eats the gesture takes that away twice:
+    the page stands still and the processor share has changed.
+    """
+    view, _ = make_view(app)
+    view.cpu.setValue(20)
+    bar = view.verticalScrollBar()
+    bar.setValue(0)
+
+    QApplication.sendEvent(view.cpu, _wheel(view.cpu))
+
+    assert view.cpu.value() == 20
+    assert bar.value() > 0
+
+
+def test_a_wheel_over_the_output_device_does_not_change_the_speaker(
+    app: QApplication,
+) -> None:
+    """The same guard, on the control where the accident matters most.
+
+    F-67 will not move to a different speaker without the user's say-so, and
+    a scroll that lands on this combo box would be exactly that -- decided by
+    where the pointer happened to be.
+    """
+    view, _ = make_view(app)
+    before = view.device.currentIndex()
+    changes = capture(view.output_device_changed)
+
+    QApplication.sendEvent(view.device, _wheel(view.device))
+
+    assert view.device.currentIndex() == before
+    assert changes == []
+
+
+def _wheel(widget: QWidget) -> QWheelEvent:
+    """One notch downwards, over the middle of the widget."""
+    centre = QPointF(widget.rect().center())
+    return QWheelEvent(
+        centre,
+        widget.mapToGlobal(centre),
+        QPoint(0, -40),
+        QPoint(0, -120),
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+        Qt.ScrollPhase.NoScrollPhase,
+        False,
+    )

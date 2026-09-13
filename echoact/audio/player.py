@@ -34,13 +34,14 @@ from __future__ import annotations
 
 import threading
 import wave
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 
 import numpy as np
 
+from ..domain import Segment
 from ..errors import Code, EchoActError
 from ..util.logging import get_logger
 from . import wav
@@ -150,6 +151,47 @@ class Timeline:
     def segment_at(self, frame: int) -> int | None:
         found = self.locate(frame)
         return self.entries[found[0]].segment_index if found else None
+
+
+def append_segment(timeline: Timeline, segment: Segment) -> Entry | None:
+    """Put one ready segment on the timeline, gap and all.
+
+    The arithmetic lives here rather than in its callers because there are
+    now two of them -- the window following its own job and F-89's external
+    playback -- and the gap is the part that is easy to get subtly wrong: it
+    is whatever the segment's own time range has left over after its audio,
+    since F-82 attributes the silence to the preceding segment.
+    """
+    if not segment.audio_path or segment.time is None:
+        return None
+    rate = timeline.sample_rate
+    span = wav.frames_for_ms(segment.time.end_ms, rate) - wav.frames_for_ms(
+        segment.time.start_ms, rate
+    )
+    return timeline.append(
+        segment.index,
+        segment.audio_path,
+        segment.frame_count,
+        max(0, span - segment.frame_count),
+    )
+
+
+def timeline_from_segments(
+    sample_rate: int, segments: Iterable[Segment], *, complete: bool = False
+) -> Timeline:
+    """A timeline for audio that already exists on disk.
+
+    Segments arrive in order and any that is not ready ends the timeline:
+    F-55 forbids presenting ungenerated audio as a finished result, and a
+    timeline that skipped a hole would do exactly that.
+    """
+    timeline = Timeline(sample_rate=sample_rate)
+    for segment in sorted(segments, key=lambda s: s.index):
+        if append_segment(timeline, segment) is None:
+            break
+    else:
+        timeline.complete = complete
+    return timeline
 
 
 class _Feeder:
@@ -368,9 +410,13 @@ class Player:
     # -- the timeline ---------------------------------------------------
 
     def load(self, timeline: Timeline) -> None:
-        """Attach a job's timeline.  Does not start playback: F-51 forbids
-        an external request from auto-playing, and F-83 lets the user turn
-        auto-play off, so starting is always someone else's decision."""
+        """Attach a job's timeline.  Does not start playback.
+
+        Starting is always someone else's decision: F-83 lets the user turn
+        auto-play off, and F-89 makes an external request's playback
+        conditional on the owner's setting and on nobody else listening.
+        Neither of those is a judgement this class could make.
+        """
         self.stop()
         self._timeline = timeline
         self._sample_rate = timeline.sample_rate

@@ -52,12 +52,12 @@ _ERROR_EXAMPLES: tuple[Code, ...] = (
 
 #: The whole external contract, exactly as Section 2.10's table lists it, as
 #: (method, path) pairs.  Written down here rather than derived from the
-#: router so that the test asserting "these twelve and no others" checks the
-#: code against the document instead of against itself.
+#: router so that the test asserting "these and no others" checks the code
+#: against the document instead of against itself.
 #:
-#: Twelve operations over eleven paths: creating a job and listing history are
-#: two methods on ``/api/v1/jobs``, which is one path to OpenAPI and two rows
-#: in the contract table.
+#: Thirteen operations over twelve paths: creating a job and listing history
+#: are two methods on ``/api/v1/jobs``, which is one path to OpenAPI and two
+#: rows in the contract table.
 CONTRACT_OPERATIONS: tuple[tuple[str, str], ...] = (
     ("GET", f"{API_PREFIX}/status"),
     ("GET", f"{API_PREFIX}/models"),
@@ -67,6 +67,7 @@ CONTRACT_OPERATIONS: tuple[tuple[str, str], ...] = (
     ("GET", f"{API_PREFIX}/jobs/{{job_id}}"),
     ("GET", f"{API_PREFIX}/jobs/{{job_id}}/text"),
     ("POST", f"{API_PREFIX}/jobs/{{job_id}}/cancel"),
+    ("POST", f"{API_PREFIX}/jobs/{{job_id}}/play"),
     ("GET", f"{API_PREFIX}/jobs/{{job_id}}/segments"),
     ("GET", f"{API_PREFIX}/jobs/{{job_id}}/segments/{{segment_id}}/audio"),
     ("GET", f"{API_PREFIX}/jobs/{{job_id}}/audio"),
@@ -147,8 +148,8 @@ def _attach_error_responses(schema: dict[str, Any]) -> None:
     """Give every operation F-57's error envelope, with examples.
 
     Attached here rather than declared on each route because the envelope is
-    the same for all twelve and Section 2.10 fixes the statuses centrally: a
-    per-route list would be twelve chances for the document and
+    the same for all of them and Section 2.10 fixes the statuses centrally: a
+    per-route list would be one chance per route for the document and
     ``echoact.errors`` to disagree about what a refusal looks like.
     """
     examples = {

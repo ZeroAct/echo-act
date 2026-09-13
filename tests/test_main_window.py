@@ -191,3 +191,152 @@ def test_the_window_can_be_built_in_korean(app, qt, tmp_path) -> None:
         w.bridge.detach()
     finally:
         i18n.set_language(i18n.Lang.EN)
+
+
+# ------------------------------------------------------------- F-89 ---
+
+
+def _external_job(app, text: str = "클라이언트가 요청한 문장입니다.") -> str:
+    """A finished one-segment job owned by a client, with real audio."""
+    import numpy as np
+
+    from echoact.audio import wav
+    from echoact.db.store import Store  # noqa: F401 - documents what owns the rows
+    from echoact.domain import (
+        Budget,
+        Job,
+        JobKind,
+        JobState,
+        RequestPath,
+        RetentionMode,
+        TimeRange,
+    )
+    from echoact.jobs.request import JobRequest, plan_segments
+    from echoact.util import ids
+
+    rate = MANIFEST.get(SUPERTONIC_3_ID).sample_rate
+    settings = VoiceSettings(SUPERTONIC_3_ID, Language.AUTO, Gender.FEMALE, "F1", SpeakingStyle.NATURAL, 1.0)
+    request = JobRequest(
+        text=text,
+        settings=settings,
+        request_path=RequestPath.REST,
+        owner_client_id="cli_test",
+        idempotency_key="k-external",
+    )
+    job = Job(
+        job_id=ids.job_id(),
+        kind=JobKind.SPEECH,
+        request_path=RequestPath.REST,
+        owner_client_id="cli_test",
+        state=JobState.ACCEPTED,
+        source_text=text,
+        settings=settings,
+        budget=Budget(cpu_percent=20, memory_bytes=2 << 30, intra_op_threads=2),
+        retention=RetentionMode.ONE_OFF,
+        created_at=ids.now(),
+        client_label="Claude Desktop",
+        idempotency_key="k-external",
+    )
+    stored, _created = app.store.claim_job(
+        job, client_id="cli_test", key="k-external", request_digest=request.digest()
+    )
+    segments = app.store.insert_segments(stored.job_id, plan_segments(text, settings))
+
+    frames = rate // 10
+    start = 0
+    for segment in segments:
+        if not segment.is_spoken:
+            continue
+        out = paths.temp_dir() / stored.job_id / f"{segment.index:05d}.wav"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        t = np.arange(frames, dtype=np.float32) / rate
+        wav.write_segment(out, (0.1 * np.sin(2 * np.pi * 220 * t)).astype(np.float32), rate)
+        app.store.mark_segment_ready(
+            stored.job_id,
+            segment.index,
+            time=TimeRange(
+                wav.ms_for_frames(start, rate), wav.ms_for_frames(start + frames, rate)
+            ),
+            audio_path=str(out),
+            frame_count=frames,
+        )
+        start += frames
+    app.store.update_job_state(stored.job_id, JobState.PREPARING_MODEL)
+    app.store.update_job_state(stored.job_id, JobState.GENERATING)
+    app.store.update_job_state(stored.job_id, JobState.COMPLETE)
+    return stored.job_id
+
+
+@pytest.fixture()
+def silent(window, monkeypatch):
+    """The window with a player that opens no device.
+
+    ``play`` is the only call that would reach PortAudio, and a test must not
+    make a sound or depend on a machine having a speaker.
+    """
+    started: list[int] = []
+    monkeypatch.setattr(window.app.player, "play", lambda: started.append(1))
+    return window, started
+
+
+def test_an_external_request_plays_without_touching_the_text_on_screen(silent, app) -> None:
+    """F-89 and F-51: the speaker is all an external request gets.
+
+    The input, its highlight, and the job the window is following are the
+    person's own, and a request from an app must leave every one of them
+    exactly as it was.
+    """
+    window, started = silent
+    window.reading.set_text("제가 쓰던 본문입니다.")
+    job_id = _external_job(app)
+
+    app.play_requests.request(job_id, client_label="Claude Desktop")
+
+    assert started == [1]
+    assert window.external.active
+    assert window.reading.source_text() == "제가 쓰던 본문입니다."
+    assert window._job_id is None
+    assert window.reading.state == "none"
+
+
+def test_the_window_names_the_client_and_keeps_stop_reachable(silent, app) -> None:
+    """F-89 leans on F-69: silencing it is reachable from the main screen.
+
+    And the banner names the client for the reason F-70 does -- audio that
+    starts on its own is otherwise unexplainable."""
+    window, _started = silent
+    job_id = _external_job(app)
+
+    app.play_requests.request(job_id, client_label="Claude Desktop")
+
+    assert window.transport.stop.isEnabled()
+    assert "Claude Desktop" in window.notice_text.text()
+
+
+def test_the_owner_takes_the_speaker_back_by_stopping(silent, app) -> None:
+    """F-50: the owner reclaims by asking. Afterwards the gate must know the
+    external job no longer holds the player."""
+    window, _started = silent
+    job_id = _external_job(app)
+    app.play_requests.request(job_id, client_label="Claude Desktop")
+
+    window._stop()
+
+    assert not window.external.active
+    assert app.play_requests.current is None
+    assert not window.notice.isVisibleTo(window)
+
+
+def test_an_external_request_does_not_move_the_owners_highlight(silent, app) -> None:
+    """The player's position belongs to text that is not on screen. F-89
+    reports the highlight unavailable rather than pointing it at the wrong
+    characters, which is what a tick that ran anyway would do."""
+    window, _started = silent
+    window.reading.set_text("제가 쓰던 본문입니다. 두 번째 문장입니다.")
+    job_id = _external_job(app)
+    app.play_requests.request(job_id, client_label="Claude Desktop")
+
+    window._on_tick()
+
+    assert window.reading.state == "none"
+    assert window.reading.source_text().startswith("제가 쓰던 본문입니다.")

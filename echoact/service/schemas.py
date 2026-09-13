@@ -1,9 +1,9 @@
-"""The wire shapes of Section 2.10's twelve operations.
+"""The wire shapes of Section 2.10's operations.
 
 These models exist for two reasons at once.  They validate what arrives, and
 they are what FastAPI turns into the machine-readable specification F-57
 requires -- so a field that is absent here is absent from the contract, and
-the twelve response models below are the whole of what a client may depend on.
+the response models below are the whole of what a client may depend on.
 
 Two rules run through all of them.
 
@@ -62,19 +62,29 @@ _STRICT = _strict()
 
 
 class VoiceIn(BaseModel):
-    """F-04 to F-08's settings, stated in full.
+    """F-04 to F-08's settings.
 
-    Nothing defaults to the owner's current GUI selection.  F-54 forbids
-    substituting an unknown model or option, and silently inheriting the
-    desktop's chosen voice would make an automated caller's output depend on
-    what the person at the keyboard last clicked.
+    Every field may be omitted, and what fills the gap is the *manifest's*
+    documented default -- never the owner's current GUI selection, which
+    would make an automated caller's output depend on what the person at the
+    keyboard last clicked.  F-54 still forbids substituting an *unknown*
+    model or option: an absent value takes a default, a wrong one is refused.
+    An omitted gender is read off the named voice rather than defaulted,
+    because a caller that named ``M1`` has already said which gender it
+    wanted and a 422 would be pedantry.
     """
 
     model_config = _STRICT
 
-    model_id: str = Field(description="Model identifier from GET /api/v1/models.")
-    voice_id: str = Field(description="Voice identifier belonging to that model.")
-    gender: Gender = Field(description="Must match the voice's own gender (F-06).")
+    model_id: str | None = Field(
+        default=None, description="Model identifier from GET /api/v1/models."
+    )
+    voice_id: str | None = Field(
+        default=None, description="Voice identifier belonging to that model."
+    )
+    gender: Gender | None = Field(
+        default=None, description="Must match the named voice's own gender (F-06)."
+    )
     language: Language = Field(
         default=Language.AUTO,
         description="'auto' resolves per sentence on whether it contains Hangul.",
@@ -105,7 +115,7 @@ class EstimateRequest(BaseModel):
     )
 
     text: str = Field(description="The text that would be spoken.")
-    voice: VoiceIn
+    voice: VoiceIn | None = None
     kind: JobKind = Field(default=JobKind.SPEECH)
 
 
@@ -142,7 +152,10 @@ class CreateJobRequest(BaseModel):
         max_length=MAX_IDEMPOTENCY_KEY_CHARS,
         description="Duplicate-prevention key, scoped to this client (F-49).",
     )
-    voice: VoiceIn
+    voice: VoiceIn | None = Field(
+        default=None,
+        description="Voice settings. Omit any part of it to take the manifest default (F-54).",
+    )
     text: str | None = Field(
         default=None, description="Inline text. Omit when uploading a file instead."
     )
@@ -155,6 +168,14 @@ class CreateJobRequest(BaseModel):
         description=(
             "Seconds to wait for a terminal state before answering (F-88). "
             "Clamped to the service's ceiling; the job is unaffected either way."
+        ),
+    )
+    play: bool = Field(
+        default=False,
+        description=(
+            "Ask for the audio to be played on the host output device as it is "
+            "generated (F-89). The job is created either way; whether playback "
+            "was accepted is reported in the response's 'playback'."
         ),
     )
     encoding: str | None = Field(
@@ -223,6 +244,24 @@ class JobProgress(BaseModel):
     fraction: float
 
 
+class PlaybackOut(BaseModel):
+    """What became of a playback request (F-89).
+
+    A refusal here is not the job's failure: the job was created, its audio
+    is retrievable, and only the speaker was unavailable -- so it is reported
+    as a field rather than as the request's status.  ``code`` is the same
+    F-57 code the dedicated play endpoint would have answered with, so a
+    caller branches on one vocabulary either way.
+    """
+
+    model_config = _STRICT
+
+    accepted: bool
+    code: str | None = None
+    message: str | None = None
+    retry_after_s: float | None = None
+
+
 class JobOut(BaseModel):
     """One job as F-54 and F-56 present it.  Never the source text: F-56 puts
     the snapshot behind its own separately authorised request."""
@@ -254,6 +293,8 @@ class JobOut(BaseModel):
     #: True when this response returned an existing job for a repeated
     #: duplicate-prevention key rather than creating one (F-49).
     duplicate: bool | None = None
+    #: Present only when playback was asked for (F-89).
+    playback: PlaybackOut | None = None
 
 
 class JobPage(BaseModel):
@@ -475,6 +516,8 @@ class CapabilitiesOut(BaseModel):
     history: bool
     results: bool
     generation: bool
+    #: F-89: whether the owner allows a client to play on the host speakers.
+    external_play: bool
 
 
 class GenerationStateOut(BaseModel):

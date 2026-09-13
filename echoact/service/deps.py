@@ -118,6 +118,11 @@ class ServiceContext:
         return self.application.registry
 
     @property
+    def play_requests(self) -> Any:
+        """F-89's gate.  Read through the application like everything else."""
+        return self.application.play_requests
+
+    @property
     def credentials(self) -> Any:
         return self.application.credentials
 
@@ -284,7 +289,7 @@ class ServiceGate:
             await self.app(scope, receive, send)
             return
         if scope["type"] != "http":
-            # Section 2.10 is twelve HTTP operations.  A WebSocket upgrade has
+            # Section 2.10 is a fixed list of HTTP operations.  A WebSocket upgrade has
             # no place in it, and answering one would be a surface nothing in
             # the contract describes.
             await _reject_non_http(scope, receive, send)

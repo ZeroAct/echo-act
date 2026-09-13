@@ -24,6 +24,7 @@ from fastapi.testclient import TestClient
 
 from echoact import paths
 from echoact.audio import wav
+from echoact.audio.player import PlayerState
 from echoact.config.settings import Settings
 from echoact.db.store import Store
 from echoact.domain import (
@@ -44,6 +45,7 @@ from echoact.jobs.engine import BUSY_RETRY_AFTER_S
 from echoact.jobs.request import JobRequest, plan_segments, validate_request
 from echoact.models.catalog import MANIFEST, SUPERTONIC_3_ID
 from echoact.models.registry import ModelRegistry
+from echoact.playrequests import PlayRequest, PlayRequests
 from echoact.policy import (
     ALLOWED_HOSTS,
     API_PREFIX,
@@ -53,6 +55,7 @@ from echoact.policy import (
     LIST_PAGE_MAX,
     MAX_REQUEST_BODY_BYTES,
     ONEOFF_RESULT_TTL_S,
+    PLAYBACK_BUSY_RETRY_AFTER_S,
     RATE_GENERATION_PER_MIN,
     RATE_OTHER_PER_MIN,
     REST_HOST,
@@ -214,9 +217,26 @@ class FakeApplication:
         self.limiter = RateLimiter()
         self.settings = Settings(voice=_voice_settings())
         self.engine = FakeEngine(self.store)
+        # F-89's gate is the real one; only the speaker is fake, because
+        # what these tests assert is which requests it refuses and why.
+        self.player = FakePlayer()
+        self.play_requests = PlayRequests(self.player, self.settings)
+        self.played: list[PlayRequest] = []
+        self.play_requests.listen(self.played.append)
+
+    def allow_play(self, allowed: bool) -> None:
+        self.settings = self.settings.with_(external_play=allowed)
+        self.play_requests.apply_settings(self.settings)
 
     def close(self) -> None:
         self.store.close()
+
+
+class FakePlayer:
+    """Only the one thing the gate reads: whether sound is coming out."""
+
+    def __init__(self) -> None:
+        self.state = PlayerState.STOPPED
 
 
 @dataclass
@@ -393,7 +413,7 @@ def error_of(response) -> dict[str, Any]:
 # ======================================================================
 
 
-def test_the_specification_describes_the_twelve_contract_operations_and_no_others(api: Api) -> None:
+def test_the_specification_describes_the_contract_operations_and_no_others(api: Api) -> None:
     spec = api.get("/openapi.json").json()
     found = {
         (method.upper(), path)
@@ -401,8 +421,8 @@ def test_the_specification_describes_the_twelve_contract_operations_and_no_other
         for method in operations
     }
     assert found == set(CONTRACT_OPERATIONS)
-    assert len(CONTRACT_OPERATIONS) == 12
-    assert len(CONTRACT_PATHS) == 11, "create and history share one path"
+    assert len(CONTRACT_OPERATIONS) == 13
+    assert len(CONTRACT_PATHS) == 12, "create and history share one path"
 
 
 def test_the_specification_defines_every_schema_it_references(api: Api) -> None:
@@ -506,15 +526,20 @@ def test_a_successful_response_also_carries_its_request_id(api: Api) -> None:
     assert streamed.headers["X-Request-Id"].startswith("req_")
 
 
-def test_the_service_never_reaches_the_player(api: Api) -> None:
-    """F-51: an external request generates only and never plays on the host
-    speakers.  The application this service is composed against carries no
-    player at all, so any attempt to reach one would fail the request."""
-    assert not hasattr(api.application, "player")
+def test_the_service_never_plays_a_job_that_did_not_ask_to_be_played(api: Api) -> None:
+    """F-51 as F-89 leaves it: generating is not playing.
+
+    The service can now reach the player -- the F-89 gate reads its state to
+    tell the owner's listening from an app's -- so the promise cannot be kept
+    by the player being out of reach any more. What keeps it is that nothing
+    on the generate-and-fetch path asks for the speaker at all.
+    """
     job_id = accepted_job(api, retain=True)
     complete_job(api.engine, job_id, retained=True)
     assert api.get(f"{API_PREFIX}/jobs/{job_id}/audio").status_code == 200
     assert api.get(f"{API_PREFIX}/jobs/{job_id}").json()["state"] == JobState.COMPLETE.value
+    assert api.application.played == []
+    assert api.application.player.state is PlayerState.STOPPED
 
 
 def test_an_error_never_carries_an_internal_path(api: Api) -> None:
@@ -1796,3 +1821,207 @@ def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
         probe.bind((REST_HOST, 0))
         return int(probe.getsockname()[1])
+
+
+# ======================================================================
+# F-89 -- playing on the host output device
+# ======================================================================
+
+
+def test_a_play_request_is_handed_to_the_window_and_answered_at_once(api: Api) -> None:
+    """F-89: the service decides whether it may be played, not whether it was
+    heard. Waiting for the speaker would make N-22's second depend on how
+    long the audio is."""
+    job_id = accepted_job(api)
+    complete_job(api.engine, job_id)
+
+    response = api.post(f"{API_PREFIX}/jobs/{job_id}/play")
+
+    assert response.status_code == 202, response.text
+    assert [r.job_id for r in api.application.played] == [job_id]
+    assert response.json()["playback"] == {
+        "accepted": True,
+        "code": None,
+        "message": None,
+        "retry_after_s": None,
+    }
+
+
+def test_a_play_request_is_refused_while_the_owner_is_listening(api: Api) -> None:
+    """F-50 and F-89: the person at the machine is never interrupted, and
+    F-57 makes the refusal one a client can act on."""
+    job_id = accepted_job(api)
+    complete_job(api.engine, job_id)
+    api.application.player.state = PlayerState.PLAYING
+
+    response = api.post(f"{API_PREFIX}/jobs/{job_id}/play")
+
+    assert response.status_code == 409
+    body = response.json()
+    assert body["code"] == Code.PLAYBACK_BUSY.value
+    assert body["retryable"] is True
+    assert body["retry_after_s"] == PLAYBACK_BUSY_RETRY_AFTER_S
+    assert "Retry-After" in response.headers
+    assert api.application.played == []
+
+
+def test_a_play_request_is_refused_permanently_when_the_owner_turned_it_off(api: Api) -> None:
+    """N-23: a refusal that trying again cannot fix must not invite a retry."""
+    job_id = accepted_job(api)
+    complete_job(api.engine, job_id)
+    api.application.allow_play(False)
+
+    response = api.post(f"{API_PREFIX}/jobs/{job_id}/play")
+
+    assert response.status_code == 403
+    body = response.json()
+    assert body["code"] == Code.PLAYBACK_NOT_ALLOWED.value
+    assert body["retryable"] is False
+    assert body.get("retry_after_s") is None
+    assert "Retry-After" not in response.headers
+    assert api.application.played == []
+
+
+def test_a_job_that_produced_no_audio_cannot_be_played(api: Api) -> None:
+    """F-55 forbids presenting an ungenerated result as a finished one, and a
+    play request for a cancelled job that got nowhere is that with a speaker
+    attached."""
+    job_id = accepted_job(api)
+    api.engine.cancel(job_id)
+
+    response = api.post(f"{API_PREFIX}/jobs/{job_id}/play")
+
+    assert response.status_code == 410
+    assert response.json()["code"] == Code.RESULT_MISSING.value
+    assert api.application.played == []
+
+
+def test_a_job_still_generating_may_be_played(api: Api) -> None:
+    """F-12's rule holds for an external request too: sound starts at the
+    first ready segment rather than at the end of the job."""
+    job_id = accepted_job(api)
+
+    response = api.post(f"{API_PREFIX}/jobs/{job_id}/play")
+
+    assert response.status_code == 202, response.text
+    assert [r.job_id for r in api.application.played] == [job_id]
+
+
+def test_another_clients_job_cannot_be_played(api: Api) -> None:
+    """F-50: a client reaches its own jobs and no others, and a refusal says
+    'no such job' rather than 'not yours'."""
+    job_id = accepted_job(api, actor="client")
+    complete_job(api.engine, job_id)
+
+    response = api.post(f"{API_PREFIX}/jobs/{job_id}/play", actor="other")
+
+    assert response.status_code == 404
+    assert api.application.played == []
+
+
+def test_creating_a_job_can_ask_for_it_to_be_played(api: Api) -> None:
+    job_id = accepted_job(api, play=True)
+
+    assert [r.job_id for r in api.application.played] == [job_id]
+
+
+def test_the_speaker_is_asked_for_before_the_bounded_wait_begins(api: Api) -> None:
+    """F-89 starts playback at the first ready segment and follows the work.
+
+    Asking after the wait returned would mean a caller that opted into ten
+    seconds spent them in silence while the audio it asked to hear was
+    already being written.
+    """
+    at_wait: list[int] = []
+    real_wait = api.engine.wait
+
+    def watched(job_id: str, timeout_s: float):
+        at_wait.append(len(api.application.played))
+        return real_wait(job_id, timeout_s)
+
+    api.engine.wait = watched  # type: ignore[method-assign]
+    api.post(f"{API_PREFIX}/jobs", json=create_body(play=True, wait_s=1))
+
+    assert at_wait == [1], "the window had not been asked by the time the wait started"
+
+
+def test_a_refused_speaker_does_not_fail_the_job_that_was_created(api: Api) -> None:
+    """The job exists, so the response has to be about the job.
+
+    Answering 409 here would tell a client its request failed when a
+    rendering had in fact started, and F-49 would hand it the same job back
+    on the retry the error invited.
+    """
+    api.application.player.state = PlayerState.PLAYING
+
+    response = api.post(f"{API_PREFIX}/jobs", json=create_body(play=True))
+
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert body["job_id"]
+    assert body["playback"]["accepted"] is False
+    assert body["playback"]["code"] == Code.PLAYBACK_BUSY.value
+    assert body["playback"]["retry_after_s"] == PLAYBACK_BUSY_RETRY_AFTER_S
+    assert api.store.get_job(body["job_id"], include_segments=False).state is JobState.ACCEPTED
+
+
+def test_a_job_created_without_asking_says_nothing_about_playback(api: Api) -> None:
+    response = api.post(f"{API_PREFIX}/jobs", json=create_body())
+    assert response.json()["playback"] is None
+    assert api.application.played == []
+
+
+def test_the_status_says_whether_playing_out_loud_is_allowed(api: Api) -> None:
+    """F-53: a caller that cannot be heard should be able to find out why
+    without having to be refused first."""
+    assert api.get(f"{API_PREFIX}/status").json()["capabilities"]["external_play"] is True
+    api.application.allow_play(False)
+    assert api.get(f"{API_PREFIX}/status").json()["capabilities"]["external_play"] is False
+
+
+# ======================================================================
+# F-54 -- voice settings the caller left out
+# ======================================================================
+
+
+def test_the_voice_may_be_left_out_and_the_manifest_default_is_reported_back(api: Api) -> None:
+    """F-54: an omitted value takes the manifest's default, and the job says
+    which. The owner's own on-screen selection is never what fills it in."""
+    from echoact.config.settings import default_voice
+
+    body = create_body()
+    body.pop("voice")
+    response = api.post(f"{API_PREFIX}/jobs", json=body)
+
+    assert response.status_code == 202, response.text
+    voice = response.json()["voice"]
+    expected = default_voice()
+    assert voice["model_id"] == expected.model_id
+    assert voice["voice_id"] == expected.voice_id
+    assert voice["gender"] == expected.gender.value
+    assert voice["style"] == expected.style.value
+    assert voice["tempo"] == expected.tempo
+
+
+def test_a_partly_stated_voice_takes_the_named_voices_own_gender(api: Api) -> None:
+    """F-06 wants the gender to match the voice. A caller that named M2 has
+    already said which it wanted, so answering VOICE_GENDER_MISMATCH to it
+    would be pedantry about a contradiction that is not there."""
+    response = api.post(
+        f"{API_PREFIX}/jobs", json=create_body(voice={"voice_id": "M2", "tempo": 1.2})
+    )
+
+    assert response.status_code == 202, response.text
+    voice = response.json()["voice"]
+    assert (voice["voice_id"], voice["gender"], voice["tempo"]) == ("M2", "male", 1.2)
+
+
+def test_a_stated_voice_that_is_wrong_is_still_refused(api: Api) -> None:
+    """An absent value takes a default; a wrong one is a refusal. F-54 draws
+    the line there and nowhere else."""
+    response = api.post(
+        f"{API_PREFIX}/jobs",
+        json=create_body(voice={"voice_id": "F1", "gender": "male"}),
+    )
+    assert response.status_code == 422
+    assert response.json()["code"] == Code.VOICE_GENDER_MISMATCH.value

@@ -17,6 +17,7 @@ from echoact.errors import Code, EchoActError
 from echoact.mcp import server as mcp_server
 from echoact.mcp.client import RestClient, describe
 from echoact.mcp.config import Connection, from_environment
+from echoact.policy import BOUNDED_WAIT_CEILING_S
 
 TOKEN = "eak_test_" + "a" * 40
 CONNECTION = Connection(base_url="http://127.0.0.1:8765", token=TOKEN, timeout_s=5.0)
@@ -72,6 +73,11 @@ class FakeService:
             return httpx.Response(200, json={"job_id": "job_1", "state": "generating"})
         if path == "/jobs/job_1/cancel":
             return httpx.Response(202, json={"job_id": "job_1", "state": "canceling"})
+        if path == "/jobs/job_1/play":
+            return httpx.Response(
+                202,
+                json={"job_id": "job_1", "state": "generating", "playback": {"accepted": True}},
+            )
         if path == "/jobs/job_1/segments":
             return httpx.Response(200, json={"segments": [], "last_sequence": 0})
         if path == "/jobs/job_1/result":
@@ -111,7 +117,7 @@ def _payload(result):
 # ------------------------------------------------------------ the shape ---
 
 
-def test_the_tool_list_is_exactly_the_eight_the_document_names() -> None:
+def test_the_tool_list_is_exactly_the_ten_the_document_names() -> None:
     """F-59: each tool maps onto one REST operation and adds no capability
     REST does not already expose. An extra tool would be one that does."""
     fake = FakeService()
@@ -120,6 +126,8 @@ def test_the_tool_list_is_exactly_the_eight_the_document_names() -> None:
         "list_models",
         "estimate_speech",
         "create_speech",
+        "speak",
+        "play_speech",
         "get_speech_job",
         "cancel_speech_job",
         "list_speech_segments",
@@ -139,10 +147,106 @@ def test_every_tool_makes_exactly_one_request() -> None:
         ("cancel_speech_job", {"job_id": "job_1"}),
         ("list_speech_segments", {"job_id": "job_1"}),
         ("list_speech_history", {}),
+        ("play_speech", {"job_id": "job_1"}),
+        ("speak", {"text": "안녕하세요.", "idempotency_key": "k-speak"}),
     ):
         fake.calls.clear()
         _call(mcp, name, **kw)
         assert len(fake.calls) == 1, f"{name} made {len(fake.calls)} requests"
+
+
+def test_speak_asks_for_playback_in_the_one_call_that_creates_the_job() -> None:
+    """F-89 through F-59: speaking aloud is create-with-play, not a second
+    capability. One REST call, and the caller is told whether it was heard."""
+    fake = FakeService(
+        **{
+            "/jobs": httpx.Response(
+                200,
+                json={
+                    "job_id": "job_1",
+                    "state": "complete",
+                    "playback": {"accepted": True},
+                },
+            )
+        }
+    )
+    mcp = mcp_server.build(CONNECTION, client=fake.client())
+    answer = _payload(_call(mcp, "speak", text="안녕하세요.", idempotency_key="k-1"))
+
+    assert [(m, p) for m, p, _ in fake.calls] == [("POST", "/jobs")]
+    _m, _p, body = fake.calls[-1]
+    assert body["play"] is True
+    assert body["kind"] == "speech"
+    assert body["idempotency_key"] == "k-1"
+    assert answer["playback"] == {"accepted": True}
+
+
+def test_speak_leaves_the_voice_out_entirely_when_the_caller_named_none() -> None:
+    """F-54's default belongs to the service, which takes it from the model
+    manifest. A voice invented here would be a second place for it to live,
+    and the two would drift."""
+    fake = FakeService()
+    mcp = mcp_server.build(CONNECTION, client=fake.client())
+    _call(mcp, "speak", text="안녕하세요.", idempotency_key="k-2")
+    _m, _p, body = fake.calls[-1]
+    assert "voice" not in body
+
+
+def test_speak_sends_only_the_voice_fields_the_caller_stated() -> None:
+    fake = FakeService()
+    mcp = mcp_server.build(CONNECTION, client=fake.client())
+    _call(mcp, "speak", text="Hello.", idempotency_key="k-3", voice_id="M2", tempo=1.2)
+    _m, _p, body = fake.calls[-1]
+    assert body["voice"] == {"voice_id": "M2", "tempo": 1.2}
+
+
+def test_speak_keeps_the_wait_inside_the_ceiling() -> None:
+    fake = FakeService()
+    mcp = mcp_server.build(CONNECTION, client=fake.client())
+    _call(mcp, "speak", text="Hello.", idempotency_key="k-4", wait_seconds=600)
+    _m, _p, body = fake.calls[-1]
+    assert body["wait_s"] == BOUNDED_WAIT_CEILING_S
+
+
+def test_a_refused_speaker_is_answered_as_data_and_not_as_an_exception() -> None:
+    """F-57: the code, whether a retry can succeed, and why. A client that
+    asked to be heard and was not has to be able to say so."""
+    fake = FakeService(
+        **{
+            "/jobs/job_1/play": httpx.Response(
+                403,
+                json={
+                    "code": "PLAYBACK_NOT_ALLOWED",
+                    "message": "EchoAct is not set to play requests from an app out loud.",
+                },
+            )
+        }
+    )
+    mcp = mcp_server.build(CONNECTION, client=fake.client())
+    answer = _payload(_call(mcp, "play_speech", job_id="job_1"))
+    assert answer["error"]["code"] == "PLAYBACK_NOT_ALLOWED"
+    assert answer["error"]["retryable"] is False
+    assert "retry_after_s" not in answer["error"]
+
+
+def test_a_busy_speaker_invites_a_retry_and_says_when() -> None:
+    fake = FakeService(
+        **{
+            "/jobs/job_1/play": httpx.Response(
+                409,
+                json={
+                    "code": "PLAYBACK_BUSY",
+                    "message": "Someone is listening to something else.",
+                    "retry_after_s": 5.0,
+                },
+            )
+        }
+    )
+    mcp = mcp_server.build(CONNECTION, client=fake.client())
+    answer = _payload(_call(mcp, "play_speech", job_id="job_1"))
+    assert answer["error"]["code"] == "PLAYBACK_BUSY"
+    assert answer["error"]["retryable"] is True
+    assert answer["error"]["retry_after_s"] == 5.0
 
 
 def test_create_speech_sends_the_kind_and_the_key() -> None:
