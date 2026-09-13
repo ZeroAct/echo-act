@@ -18,6 +18,17 @@ the app works with no network connection at all.
 Windows 11 and macOS 14 (Apple Silicon). No Python, Node, or database server
 to install.
 
+## Run it with one command
+
+With [uv](https://docs.astral.sh/uv/) installed, no checkout or venv needed:
+
+```
+uvx echoact
+```
+
+uv fetches EchoAct into an isolated environment and starts the app. The MCP
+server is the same package: `uvx --from echoact echoact-mcp`.
+
 ## Running it from a checkout
 
 ```
@@ -87,6 +98,10 @@ tests/            pytest. `-m engine` needs the model; the rest does not.
 ```
 
 `CLAUDE.md` is the contributor's short version.
+
+## Author
+
+Huijae Lee (ZeroAct) — lhj56822@gmail.com — [github.com/ZeroAct](https://github.com/ZeroAct)
 
 ## Licence
 

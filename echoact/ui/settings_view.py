@@ -103,6 +103,12 @@ if TYPE_CHECKING:  # pragma: no cover - imports for types only
 MIN_USER_PORT: Final = 1024
 MAX_PORT: Final = 65535
 
+#: The author credit shown at the top of the screen.  It is the same in
+#: every language, so it is deliberately absent from the translation table.
+AUTHOR: Final = "Huijae Lee (ZeroAct)"
+AUTHOR_GITHUB_URL: Final = "https://github.com/ZeroAct"
+AUTHOR_GITHUB_LABEL: Final = "github.com/ZeroAct"
+
 #: F-75's change history.  There is no changelog file in the repository yet,
 #: so the history lives beside the screen that shows it rather than being
 #: invented at display time; a release that adds one should read it instead.
@@ -618,6 +624,7 @@ class SettingsView(QScrollArea):
         column.addWidget(
             self._label("Everything EchoAct remembers between launches.", "secondary")
         )
+        column.addWidget(self._credit_line())
         column.addWidget(self._build_resources())
         column.addWidget(self._build_audio())
         column.addWidget(self._build_display())
@@ -668,6 +675,29 @@ class SettingsView(QScrollArea):
             lb.setProperty("role", role)
         lb.setWordWrap(True)
         self._text(lb, source, **fmt)
+        return lb
+
+    def _credit_line(self) -> QLabel:
+        """The author credit at the top of the screen.
+
+        Deliberately not recorded through :meth:`_text`: the name and the
+        handle are the same in every language, so recording them would only
+        give the translator a string they cannot improve.  The link opens in
+        the browser rather than anywhere in-app -- EchoAct has no page to
+        show it in, and opening externally is what makes the one network
+        request it causes the user's own.
+        """
+        lb = QLabel()
+        lb.setProperty("role", "muted")
+        lb.setWordWrap(True)
+        lb.setTextFormat(Qt.TextFormat.RichText)
+        lb.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        lb.setOpenExternalLinks(True)
+        lb.setText(
+            f'{AUTHOR} · <a href="{AUTHOR_GITHUB_URL}" '
+            f'style="color:{self._palette.accent};">{AUTHOR_GITHUB_LABEL}</a>'
+        )
+        lb.setAccessibleName(f"{AUTHOR} — {AUTHOR_GITHUB_URL}")
         return lb
 
     def _value_label(self, role: str | None = "secondary") -> QLabel:

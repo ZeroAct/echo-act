@@ -229,7 +229,7 @@ wheels = [
 ]
 
 [[package]]
-name = "echo-act"
+name = "echoact"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
