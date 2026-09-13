@@ -192,3 +192,8 @@ SCHEDULED_BACKUP_DEFAULT: Final = False  # 4.1
 
 # N-12: the on-screen highlight must track the audio clock this closely.
 HIGHLIGHT_SYNC_BUDGET_MS: Final = 300
+
+# F-75's version query.  A person pressed the button and is looking at the
+# screen, so the answer or the explanation arrives within one patience
+# window; a background check would get a server-side timeout instead.
+RELEASE_CHECK_TIMEOUT_S: Final[float] = 10.0

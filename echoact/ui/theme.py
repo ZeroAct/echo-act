@@ -76,16 +76,20 @@ class Palette:
     is_dark: bool
 
 
+# The neutrals carry a faint bias toward the accent rather than sitting at
+# zero saturation: a grey with a hue relation reads as chosen, and it is what
+# lets the indigo tile sit on the window without looking imported from
+# another product.  Contrast floors are unchanged by the shift.
 LIGHT = Palette(
-    canvas="#f4f4f2",
+    canvas="#f5f6fa",
     surface="#ffffff",
-    page="#fdfdfc",
-    raised="#ececeb",
-    border="#e2e2df",
-    border_strong="#c6c6c1",
-    text="#1a1a19",
-    text_secondary="#5c5c58",
-    text_muted="#8b8b85",
+    page="#fdfdff",
+    raised="#ecedf4",
+    border="#e2e3ee",
+    border_strong="#c4c6d4",
+    text="#1c1e2b",
+    text_secondary="#5c5f72",
+    text_muted="#8b8e9c",
     text_on_accent="#ffffff",
     accent="#3f4bd6",
     accent_hover="#4d58e0",
@@ -95,20 +99,20 @@ LIGHT = Palette(
     warn="#9a6300",
     danger="#b3261e",
     emphasis="#111827",
-    emphasis_waiting="#8b8b85",
+    emphasis_waiting="#8b8e9c",
     is_dark=False,
 )
 
 DARK = Palette(
-    canvas="#161615",
-    surface="#1e1e1d",
-    page="#1a1a19",
-    raised="#2a2a28",
-    border="#2f2f2d",
-    border_strong="#4a4a47",
-    text="#eeeeec",
-    text_secondary="#a8a8a3",
-    text_muted="#77776f",
+    canvas="#15161e",
+    surface="#1c1e28",
+    page="#1a1b24",
+    raised="#292c3a",
+    border="#2b2d3b",
+    border_strong="#474a5e",
+    text="#e7e8f2",
+    text_secondary="#a6a9bd",
+    text_muted="#7d8093",
     text_on_accent="#ffffff",
     accent="#7c86f5",
     accent_hover="#8e97ff",
@@ -117,8 +121,8 @@ DARK = Palette(
     ok="#4bbd85",
     warn="#d9a441",
     danger="#f0837b",
-    emphasis="#f5f5f3",
-    emphasis_waiting="#77776f",
+    emphasis="#f2f3fa",
+    emphasis_waiting="#7d8093",
     is_dark=True,
 )
 

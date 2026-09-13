@@ -1,0 +1,333 @@
+<title>Ripple Candidates</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@600;700;800&family=Instrument+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root{
+  --paper:#f6f6fa; --panel:#ffffff; --ink:#1c1e2b; --muted:#5c5f72;
+  --line:#e2e3ee; --accent:#3f4bd6; --accent-soft:#e8eaff;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --paper:#15161e; --panel:#1c1e28; --ink:#e7e8f2; --muted:#9a9db2;
+    --line:#2b2d3b; --accent:#7c86f5; --accent-soft:#26284a;
+  }
+}
+:root[data-theme="dark"]{
+  --paper:#15161e; --panel:#1c1e28; --ink:#e7e8f2; --muted:#9a9db2;
+  --line:#2b2d3b; --accent:#7c86f5; --accent-soft:#26284a;
+}
+*{box-sizing:border-box}
+body{
+  margin:0; background:var(--paper); color:var(--ink);
+  font:400 14.5px/1.55 "Instrument Sans","Segoe UI",system-ui,sans-serif;
+  padding-inline:clamp(16px,4vw,28px);
+}
+.wrap{max-width:1080px;margin:0 auto;padding-block:44px 72px}
+.eyebrow{
+  font:500 11px/1 "IBM Plex Mono",ui-monospace,monospace;
+  letter-spacing:.16em;text-transform:uppercase;color:var(--muted);margin:0 0 14px;
+}
+h1{
+  font:800 clamp(32px,6vw,46px)/1.05 "Bricolage Grotesque","Instrument Sans",sans-serif;
+  letter-spacing:-0.022em;text-wrap:balance;margin:0 0 12px;
+}
+.lede{max-width:62ch;color:var(--muted);font-size:15.5px;margin:0}
+h2{
+  font:700 21px/1.2 "Bricolage Grotesque","Instrument Sans",sans-serif;
+  letter-spacing:-0.01em;margin:56px 0 6px;
+}
+.h2note{color:var(--muted);margin:0 0 20px;max-width:62ch}
+
+/* grammar strip */
+.grammar{
+  display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));
+  gap:18px 26px;border-block:1px solid var(--line);padding-block:18px;margin-top:30px;
+}
+.g-item{display:flex;gap:12px;align-items:center}
+.g-item svg{color:var(--accent);flex:none}
+.g-item b{display:block;font-weight:600;font-size:13.5px}
+.g-item span{display:block;color:var(--muted);font-size:12.5px;line-height:1.4}
+
+/* candidate cards */
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(242px,1fr));gap:18px}
+.card{
+  background:var(--panel);border:1px solid var(--line);border-radius:14px;
+  padding:20px 20px 16px;display:flex;flex-direction:column;gap:12px;
+}
+.stage{display:flex;align-items:center;justify-content:center;height:132px;color:var(--accent)}
+.stage svg{transition:transform .25s ease,opacity .25s ease}
+@media (prefers-reduced-motion:no-preference){
+  .card:hover .stage svg{transform:scale(1.045);animation:ripple .7s ease-out}
+}
+@keyframes ripple{from{transform:scale(.93);opacity:.55}}
+.card h3{font:700 19px/1.2 "Bricolage Grotesque",sans-serif;margin:0;letter-spacing:-0.01em}
+.role{
+  font:500 10.5px/1 "IBM Plex Mono",monospace;letter-spacing:.14em;
+  text-transform:uppercase;color:var(--accent);
+}
+.card p{margin:0;color:var(--muted);font-size:13.5px;line-height:1.55}
+.ladder{
+  display:flex;align-items:flex-end;gap:16px;flex-wrap:wrap;
+  border-top:1px solid var(--line);padding-top:14px;color:var(--accent);
+}
+.ladder figure{margin:0;display:flex;flex-direction:column;align-items:center;gap:6px}
+.ladder figcaption{font:400 10px/1 "IBM Plex Mono",monospace;color:var(--muted)}
+.on-dark{
+  background:#15161e;border-radius:10px;padding:10px 14px;margin-top:12px;
+  display:flex;align-items:center;gap:14px;
+}
+.on-dark .sw{color:#7c86f5;display:flex;align-items:center;gap:14px}
+.on-dark .tag{
+  font:400 10px/1 "IBM Plex Mono",monospace;color:#8a8da8;margin-left:auto;
+  letter-spacing:.06em;white-space:nowrap;
+}
+
+/* lockups */
+.locks{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:18px}
+.lock{
+  background:var(--panel);border:1px solid var(--line);border-radius:14px;
+  min-height:150px;display:flex;flex-direction:column;align-items:center;
+  justify-content:center;gap:6px;padding:26px 20px 14px;position:relative;
+}
+.lock .cap{
+  position:absolute;bottom:10px;left:0;right:0;text-align:center;
+  font:400 10px/1 "IBM Plex Mono",monospace;color:var(--muted);letter-spacing:.08em;
+}
+.wordmark{display:flex;align-items:center;gap:13px}
+.wordmark .wm{
+  font:800 30px/1 "Bricolage Grotesque",sans-serif;letter-spacing:-0.02em;color:var(--ink);
+}
+.wordmark .wm i{font-style:normal;color:var(--accent)}
+.hangul{
+  font:500 12px/1 "Malgun Gothic","Apple SD Gothic Neo",sans-serif;
+  letter-spacing:.42em;color:var(--muted);text-indent:.42em;
+}
+.stack{display:flex;flex-direction:column;align-items:center;gap:10px}
+.tile{
+  width:88px;height:88px;border-radius:21%;display:flex;align-items:center;
+  justify-content:center;flex:none;
+}
+.t-accent{background:#3f4bd6;color:#ffffff;box-shadow:0 6px 18px rgba(63,75,214,.28)}
+.t-light{background:#ffffff;color:#3f4bd6;border:1px solid #e2e3ee}
+.t-dark{background:#1c1e28;color:#7c86f5;border:1px solid #2b2d3b}
+.tiles{display:flex;gap:16px;align-items:center}
+
+/* taskbars */
+.taskbar{
+  height:52px;border-radius:12px;display:flex;align-items:center;
+  gap:6px;padding:0 12px;margin-top:14px;overflow-x:auto;
+}
+.tb-dark{background:#1a1b22;border:1px solid #2b2d3b}
+.tb-light{background:#eceef6;border:1px solid var(--line)}
+.tb-item{display:flex;align-items:center;gap:9px;padding:7px 12px;border-radius:8px;font-size:13px;white-space:nowrap}
+.tb-dark .tb-item{color:#d6d8e6}
+.tb-light .tb-item{color:#33364a}
+.tb-item.active-d{background:#2b2d3e}
+.tb-item.active-l{background:#ffffff;box-shadow:0 1px 3px rgba(20,22,40,.12)}
+.tb-cap{font:400 10.5px/1 "IBM Plex Mono",monospace;color:var(--muted);letter-spacing:.06em;margin:8px 0 0}
+
+/* recommendation */
+.pick{
+  background:var(--accent-soft);border-radius:16px;padding:26px 26px 24px;margin-top:20px;
+  display:grid;grid-template-columns:auto 1fr;gap:26px;align-items:center;
+}
+.pick .vis{display:flex;align-items:center;gap:16px;color:var(--accent)}
+.pick .vis .arrow{font:400 22px/1 "IBM Plex Mono",monospace;color:var(--muted)}
+.pick h3{font:700 19px/1.25 "Bricolage Grotesque",sans-serif;margin:0 0 8px}
+.pick p{margin:0 0 8px;max-width:60ch;font-size:14px;line-height:1.6}
+.pick p:last-child{margin-bottom:0}
+.pick strong{font-weight:600}
+@media (max-width:640px){ .pick{grid-template-columns:1fr} }
+</style>
+
+<div class="wrap">
+
+  <p class="eyebrow">EchoAct · identity study · one concept, four drawings</p>
+  <h1>Ripple Candidates</h1>
+  <p class="lede">The Korean word for echo — <b>에코</b> — begins with <b>ㅇ</b>, a circle.
+  Four drawings of that idea, each shown at the sizes it has to survive and on both
+  grounds the app ships on. The accent is EchoAct's own <span style="font-family:'IBM Plex Mono',monospace;font-size:13px">#3f4bd6</span>.</p>
+
+  <div class="grammar">
+    <div class="g-item">
+      <svg width="34" height="34" viewBox="0 0 64 64"><circle cx="32" cy="32" r="7" fill="currentColor"/></svg>
+      <div><b>The filled dot</b><span>the source text — the only solid thing</span></div>
+    </div>
+    <div class="g-item">
+      <svg width="34" height="34" viewBox="0 0 64 64"><circle cx="32" cy="32" r="11" fill="none" stroke="currentColor" stroke-width="4.4" opacity=".85"/><circle cx="32" cy="32" r="22" fill="none" stroke="currentColor" stroke-width="4" opacity=".45"/></svg>
+      <div><b>The outline rings</b><span>voice travelling outward, thinning as it goes</span></div>
+    </div>
+    <div class="g-item">
+      <svg width="34" height="34" viewBox="0 0 64 64"><rect x="9" y="9" width="46" height="46" rx="14" fill="none" stroke="currentColor" stroke-width="4.4"/><rect x="21" y="21" width="22" height="22" rx="7" fill="none" stroke="currentColor" stroke-width="4.4"/></svg>
+      <div><b>Outline, never weight</b><span>the app's own marking rule: nothing shifts when emphasised</span></div>
+    </div>
+  </div>
+
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+    <defs>
+      <symbol id="a-full" viewBox="0 0 64 64">
+        <circle cx="32" cy="32" r="5.4" fill="currentColor"/>
+        <circle cx="32" cy="32" r="14.5" fill="none" stroke="currentColor" stroke-width="4.2" opacity=".8"/>
+        <circle cx="32" cy="32" r="23.5" fill="none" stroke="currentColor" stroke-width="3.8" opacity=".5"/>
+        <circle cx="32" cy="32" r="29.6" fill="none" stroke="currentColor" stroke-width="3.4" opacity=".26"/>
+      </symbol>
+      <symbol id="a-sm" viewBox="0 0 64 64">
+        <circle cx="32" cy="32" r="6.2" fill="currentColor"/>
+        <circle cx="32" cy="32" r="16.5" fill="none" stroke="currentColor" stroke-width="5" opacity=".85"/>
+        <circle cx="32" cy="32" r="26.5" fill="none" stroke="currentColor" stroke-width="4.4" opacity=".45"/>
+      </symbol>
+      <symbol id="b-mark" viewBox="0 0 64 64">
+        <circle cx="32" cy="32" r="20.5" fill="none" stroke="currentColor" stroke-width="7.5"/>
+        <circle cx="32" cy="32" r="5.2" fill="currentColor"/>
+      </symbol>
+      <symbol id="c-mark" viewBox="0 0 64 64">
+        <circle cx="32" cy="39.5" r="4.8" fill="currentColor"/>
+        <path d="M 23 39.5 A 9 9 0 0 1 41 39.5" fill="none" stroke="currentColor" stroke-width="4" stroke-linecap="round" opacity=".8"/>
+        <path d="M 16 39.5 A 16 16 0 0 1 48 39.5" fill="none" stroke="currentColor" stroke-width="3.7" stroke-linecap="round" opacity=".52"/>
+        <path d="M 9 39.5 A 23 23 0 0 1 55 39.5" fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" opacity=".28"/>
+        <path d="M 9 52 H 55" fill="none" stroke="currentColor" stroke-width="4.4" stroke-linecap="round" opacity=".9"/>
+      </symbol>
+      <symbol id="d-mark" viewBox="0 0 64 64">
+        <rect x="7" y="28.5" width="15" height="7" rx="3.5" fill="currentColor"/>
+        <rect x="3.5" y="24.5" width="22" height="15" rx="7.5" fill="none" stroke="currentColor" stroke-width="3.2"/>
+        <rect x="29" y="24.5" width="22" height="15" rx="7.5" fill="none" stroke="currentColor" stroke-width="3.2" opacity=".48"/>
+        <rect x="45.5" y="24.5" width="15" height="15" rx="7.5" fill="none" stroke="currentColor" stroke-width="3.2" opacity=".24"/>
+      </symbol>
+    </defs>
+  </svg>
+
+  <h2>The four drawings</h2>
+  <p class="h2note">Below 32 px the ladder drops the faintest ring — that reduction is deliberate, not an accident of size.</p>
+  <div class="grid">
+
+    <div class="card">
+      <div class="stage"><svg width="118" height="118"><use href="#a-full"/></svg></div>
+      <p class="role">a · the plain statement</p>
+      <h3>Origin</h3>
+      <p>The literal idea: voice leaving a fixed point. Three rings at large sizes,
+      two under 32 px. Nothing to misread anywhere — and nothing wasted.</p>
+      <div class="ladder">
+        <figure><svg width="48" height="48"><use href="#a-full"/></svg><figcaption>48</figcaption></figure>
+        <figure><svg width="32" height="32"><use href="#a-sm"/></svg><figcaption>32</figcaption></figure>
+        <figure><svg width="20" height="20"><use href="#a-sm"/></svg><figcaption>20</figcaption></figure>
+        <figure><svg width="16" height="16"><use href="#a-sm"/></svg><figcaption>16</figcaption></figure>
+      </div>
+      <div class="on-dark"><span class="sw"><svg width="44" height="44"><use href="#a-full"/></svg><svg width="24" height="24"><use href="#a-sm"/></svg><svg width="16" height="16"><use href="#a-sm"/></svg></span><span class="tag">dark taskbar</span></div>
+    </div>
+
+    <div class="card">
+      <div class="stage"><svg width="118" height="118"><use href="#b-mark"/></svg></div>
+      <p class="role">b · the letter is the picture</p>
+      <h3>Ieung</h3>
+      <p>A heavy ring and one dot: ㅇ itself, with the sound's origin inside it.
+      Two elements only, so it survives every size — the honest favicon.</p>
+      <div class="ladder">
+        <figure><svg width="48" height="48"><use href="#b-mark"/></svg><figcaption>48</figcaption></figure>
+        <figure><svg width="32" height="32"><use href="#b-mark"/></svg><figcaption>32</figcaption></figure>
+        <figure><svg width="20" height="20"><use href="#b-mark"/></svg><figcaption>20</figcaption></figure>
+        <figure><svg width="16" height="16"><use href="#b-mark"/></svg><figcaption>16</figcaption></figure>
+      </div>
+      <div class="on-dark"><span class="sw"><svg width="44" height="44"><use href="#b-mark"/></svg><svg width="24" height="24"><use href="#b-mark"/></svg><svg width="16" height="16"><use href="#b-mark"/></svg></span><span class="tag">dark taskbar</span></div>
+    </div>
+
+    <div class="card">
+      <div class="stage"><svg width="118" height="118"><use href="#c-mark"/></svg></div>
+      <p class="role">c · text speaks</p>
+      <h3>Horizon</h3>
+      <p>A line of reading, and ripples rising from a point on it — what the app
+      actually does, in two strokes. The baseline is load-bearing: it turns echo into <em>read-aloud</em>.</p>
+      <div class="ladder">
+        <figure><svg width="48" height="48"><use href="#c-mark"/></svg><figcaption>48</figcaption></figure>
+        <figure><svg width="32" height="32"><use href="#c-mark"/></svg><figcaption>32</figcaption></figure>
+        <figure><svg width="20" height="20"><use href="#c-mark"/></svg><figcaption>20</figcaption></figure>
+        <figure><svg width="16" height="16"><use href="#c-mark"/></svg><figcaption>16</figcaption></figure>
+      </div>
+      <div class="on-dark"><span class="sw"><svg width="44" height="44"><use href="#c-mark"/></svg><svg width="24" height="24"><use href="#c-mark"/></svg><svg width="16" height="16"><use href="#c-mark"/></svg></span><span class="tag">dark taskbar</span></div>
+    </div>
+
+    <div class="card">
+      <div class="stage"><svg width="118" height="118"><use href="#d-mark"/></svg></div>
+      <p class="role">d · the mark repeats</p>
+      <h3>Caret Echo</h3>
+      <p>The reading caret from the main screen — an outline, never a heavier
+      weight — reproduced three times and fading, so the icon's own signature is "echo."</p>
+      <div class="ladder">
+        <figure><svg width="48" height="48"><use href="#d-mark"/></svg><figcaption>48</figcaption></figure>
+        <figure><svg width="32" height="32"><use href="#d-mark"/></svg><figcaption>32</figcaption></figure>
+        <figure><svg width="20" height="20"><use href="#d-mark"/></svg><figcaption>20</figcaption></figure>
+        <figure><svg width="16" height="16"><use href="#d-mark"/></svg><figcaption>16</figcaption></figure>
+      </div>
+      <div class="on-dark"><span class="sw"><svg width="44" height="44"><use href="#d-mark"/></svg><svg width="24" height="24"><use href="#d-mark"/></svg><svg width="16" height="16"><use href="#d-mark"/></svg></span><span class="tag">dark taskbar</span></div>
+    </div>
+
+  </div>
+
+  <h2>Lockups and the tile</h2>
+  <p class="h2note">One accent, one ground colour per state. The wordmark sets “Act” in the accent so the name says what it does.</p>
+  <div class="locks">
+
+    <div class="lock">
+      <div class="wordmark">
+        <svg width="44" height="44" style="color:var(--accent)"><use href="#a-sm"/></svg>
+        <span class="wm">Echo<i>Act</i></span>
+      </div>
+      <span class="hangul">에코액트</span>
+      <span class="cap">horizontal · window title, README</span>
+    </div>
+
+    <div class="lock">
+      <div class="stack">
+        <svg width="52" height="52" style="color:var(--accent)"><use href="#a-full"/></svg>
+        <span class="wm" style="font-size:22px">Echo<i style="font-style:normal;color:var(--accent)">Act</i></span>
+      </div>
+      <span class="cap">stacked · about screen</span>
+    </div>
+
+    <div class="lock">
+      <div class="tiles">
+        <div class="tile t-accent"><svg width="58" height="58"><use href="#a-full"/></svg></div>
+        <div class="tile t-light"><svg width="58" height="58"><use href="#a-full"/></svg></div>
+        <div class="tile t-dark"><svg width="52" height="52"><use href="#b-mark"/></svg></div>
+      </div>
+      <span class="cap">app tile · accent / light / dark</span>
+    </div>
+
+  </div>
+
+  <h2>On the taskbar</h2>
+  <p class="h2note">The real test at 26 px, next to strangers. The tile carries it; the bare mark does not need to.</p>
+  <div class="taskbar tb-dark">
+    <div class="tile" style="width:28px;height:28px;border-radius:7px;background:#3f4bd6;color:#fff;flex:none"><svg width="20" height="20"><use href="#a-sm"/></svg></div>
+    <span class="tb-item">EchoAct</span>
+    <span class="tb-item active-d">Explorer</span>
+    <span class="tb-item">Terminal</span>
+    <span class="tb-item">Mail</span>
+  </div>
+  <p class="tb-cap">windows 11 · dark</p>
+  <div class="taskbar tb-light">
+    <div class="tile" style="width:28px;height:28px;border-radius:7px;background:#3f4bd6;color:#fff;flex:none"><svg width="20" height="20"><use href="#a-sm"/></svg></div>
+    <span class="tb-item">EchoAct</span>
+    <span class="tb-item active-l">Explorer</span>
+    <span class="tb-item">Terminal</span>
+    <span class="tb-item">Mail</span>
+  </div>
+  <p class="tb-cap">windows 11 · light</p>
+
+  <h2>The pick</h2>
+  <div class="pick">
+    <div class="vis">
+      <svg width="72" height="72"><use href="#a-full"/></svg>
+      <span class="arrow">→</span>
+      <svg width="72" height="72"><use href="#b-mark"/></svg>
+    </div>
+    <div>
+      <h3>Origin as the icon; Ieung is already hiding inside it</h3>
+      <p>Take Origin's dot and its heaviest ring and discard the rest — that is Ieung.
+      So the small form is not a second design: <strong>it is the same drawing, told the truth about 16 px.</strong>
+      Ship Origin for the tile and lockups, and let the ladder fall to Ieung under 24 px.</p>
+      <p>Horizon earns the about screen and the installer, where the story is told in one
+      sentence — and Caret Echo belongs to the loading state: a caret ripple animating outward
+      while the first sentence renders. One concept, four jobs, zero extra invention.</p>
+    </div>
+  </div>
+
+</div>

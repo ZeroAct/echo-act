@@ -9,6 +9,8 @@ than mostly true.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from PySide6.QtCore import QEvent, QObject, Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractScrollArea,
@@ -33,6 +35,45 @@ from . import icons
 from .i18n import add_korean, duration, tr
 from .theme import METRICS, Palette
 
+
+def remember(owner: object, apply: Callable[[], None]) -> None:
+    """Record one piece of text on its widget and set it now (F-86).
+
+    The recorded callable closes over the widget and the English source,
+    so a retranslation pass is a loop over closures: no registry to keep
+    in step, and nothing to translate can be shown without having gone
+    through here.  ``SettingsView`` keeps the same contract with its own
+    ``_text``; this is that idea for the widgets beside it.
+    """
+    hooks: list[Callable[[], None]] | None = getattr(owner, "_text_hooks", None)
+    if hooks is None:
+        hooks = []
+        owner._text_hooks = hooks  # type: ignore[attr-defined]
+    hooks.append(apply)
+    apply()
+
+
+def apply_translations(owner: object) -> None:
+    """Re-run every :func:`remember`-ed setter on ``owner``."""
+    for apply in getattr(owner, "_text_hooks", []):
+        apply()
+
+
+def is_alive(widget: QWidget) -> bool:
+    """Whether the C++ object behind a Qt wrapper still exists.
+
+    Language listeners outlive the widgets that registered (the registry
+    lives as long as the process), and calling into a deleted C++ object
+    is the crash this guards -- the same discipline
+    ``settings_view._follow_language`` applies to its own screen.
+    """
+    try:
+        from shiboken6 import isValid
+    except ImportError:  # pragma: no cover - shiboken ships with PySide6
+        return True
+    return bool(isValid(widget))
+
+
 add_korean(
     {
         "Reading": "읽기",
@@ -43,6 +84,10 @@ add_korean(
         "Open file": "파일 열기",
         "Save audio": "오디오 저장",
         "Save the part generated so far": "지금까지 생성된 부분 저장",
+        # Absent until a retranslation pass made the fallback visible: the
+        # word only ever appeared as an accessible name, so English-only
+        # went unnoticed in the Korean interface.
+        "Playback position": "재생 위치",
     }
 )
 
@@ -155,34 +200,47 @@ class VoicePanel(QFrame):
         box.setContentsMargins(m.pad, m.pad, m.pad, m.pad)
         box.setSpacing(m.gap)
 
-        box.addWidget(label(tr("Voice"), "section"))
+        head = label("", "section")
+        remember(self, lambda: head.setText(tr("Voice")))
+        box.addWidget(head)
 
+        # Item specs are kept as (data, English source) rather than as the
+        # translated items, so a language switch can re-word each row in
+        # place -- ``setItemText`` leaves the data and the selection alone,
+        # which is the difference between switching a language and losing
+        # the voice the user had chosen.
+        self._language_spec: tuple[tuple[Language, str], ...] = (
+            (Language.AUTO, "Automatic"),
+            (Language.KO, "Korean"),
+            (Language.EN, "English"),
+        )
         self.language = QComboBox()
-        for lang, text in (
-            (Language.AUTO, tr("Automatic")),
-            (Language.KO, tr("Korean")),
-            (Language.EN, tr("English")),
-        ):
-            self.language.addItem(text, lang)
-        self._row(box, tr("Language"), self.language)
+        for data, source in self._language_spec:
+            self.language.addItem(tr(source), data)
+        self._row(box, "Language", self.language)
 
+        self._gender_spec: tuple[tuple[Gender, str], ...] = (
+            (Gender.FEMALE, "Female"),
+            (Gender.MALE, "Male"),
+        )
         self.gender = QComboBox()
-        self.gender.addItem(tr("Female"), Gender.FEMALE)
-        self.gender.addItem(tr("Male"), Gender.MALE)
-        self._row(box, tr("Gender"), self.gender)
+        for data, source in self._gender_spec:
+            self.gender.addItem(tr(source), data)
+        self._row(box, "Gender", self.gender)
 
         self.voice = QComboBox()
-        self._row(box, tr("Voice"), self.voice)
+        self._row(box, "Voice", self.voice)
 
+        self._style_spec: tuple[tuple[SpeakingStyle, str], ...] = (
+            (SpeakingStyle.NATURAL, "Natural"),
+            (SpeakingStyle.CALM, "Calm"),
+            (SpeakingStyle.BRIGHT, "Bright"),
+            (SpeakingStyle.NARRATION, "Narration"),
+        )
         self.style = QComboBox()
-        for style, text in (
-            (SpeakingStyle.NATURAL, tr("Natural")),
-            (SpeakingStyle.CALM, tr("Calm")),
-            (SpeakingStyle.BRIGHT, tr("Bright")),
-            (SpeakingStyle.NARRATION, tr("Narration")),
-        ):
-            self.style.addItem(text, style)
-        self._row(box, tr("Style"), self.style)
+        for data, source in self._style_spec:
+            self.style.addItem(tr(source), data)
+        self._row(box, "Style", self.style)
 
         # Tempo is a slider rather than a spin box: it is the one setting a
         # user adjusts by ear, and a slider invites the small nudges that
@@ -190,7 +248,9 @@ class VoicePanel(QFrame):
         # the user is entitled to see exactly.
         tempo_row = QHBoxLayout()
         tempo_row.setSpacing(m.gap)
-        tempo_row.addWidget(label(tr("Tempo"), "secondary"))
+        tempo_caption = label("", "secondary")
+        remember(self, lambda: tempo_caption.setText(tr("Tempo")))
+        tempo_row.addWidget(tempo_caption)
         tempo_row.addStretch(1)
         self.tempo_value = label("1.00x", "secondary")
         tempo_row.addWidget(self.tempo_value)
@@ -201,24 +261,30 @@ class VoicePanel(QFrame):
         self.tempo.setSingleStep(5)
         self.tempo.setPageStep(10)
         self.tempo.setValue(100)
-        self.tempo.setAccessibleName(tr("Tempo"))
+        remember(self, lambda: self.tempo.setAccessibleName(tr("Tempo")))
         box.addWidget(self.tempo)
 
         box.addWidget(separator())
-        box.addWidget(label(tr("While reading"), "section"))
+        reading_head = label("", "section")
+        remember(self, lambda: reading_head.setText(tr("While reading")))
+        box.addWidget(reading_head)
 
-        self.autoplay = QCheckBox(tr("Play as soon as ready"))
+        self.autoplay = QCheckBox()
+        remember(self, lambda: self.autoplay.setText(tr("Play as soon as ready")))
         self.autoplay.setChecked(True)
         box.addWidget(self.autoplay)
 
-        self.follow = QCheckBox(tr("Follow the reading position"))
+        self.follow = QCheckBox()
+        remember(self, lambda: self.follow.setText(tr("Follow the reading position")))
         self.follow.setChecked(True)
         box.addWidget(self.follow)
 
         box.addWidget(separator())
         # F-22 and N-09: the budget in force is on the main screen, not
         # only behind the settings button.
-        box.addWidget(label(tr("Resource budget"), "secondary"))
+        budget_caption = label("", "secondary")
+        remember(self, lambda: budget_caption.setText(tr("Resource budget")))
+        box.addWidget(budget_caption)
         self.resources = label("", "muted")
         self.resources.setWordWrap(True)
         box.addWidget(self.resources)
@@ -237,10 +303,32 @@ class VoicePanel(QFrame):
         self.autoplay.toggled.connect(self.autoplay_toggled)
         self.follow.toggled.connect(self.follow_toggled)
 
-    def _row(self, box: QVBoxLayout, name: str, widget: QWidget) -> None:
-        box.addWidget(label(name, "secondary"))
-        widget.setAccessibleName(name)
+    def _row(self, box: QVBoxLayout, source: str, widget: QWidget) -> None:
+        """Caption above, control below, and both remembered (F-86).
+
+        The caption is a separate label rather than a placeholder because
+        N-30 needs the control to carry an accessible name a screen reader
+        announces without hovering, and both halves re-word together.
+        """
+        caption = label("", "secondary")
+
+        def apply() -> None:
+            caption.setText(tr(source))
+            widget.setAccessibleName(tr(source))
+
+        remember(self, apply)
+        box.addWidget(caption)
         box.addWidget(widget)
+
+    def retranslate(self) -> None:
+        apply_translations(self)
+        for combo, spec in (
+            (self.language, self._language_spec),
+            (self.gender, self._gender_spec),
+            (self.style, self._style_spec),
+        ):
+            for index, (_data, source) in enumerate(spec):
+                combo.setItemText(index, tr(source))
 
     def _populate_voices(self, gender: Gender) -> None:
         was = self._muted
@@ -333,19 +421,20 @@ class TransportBar(QWidget):
         self._palette = palette
         self._scrubbing = False
         self._playable_ms = 0
+        self._generating = False
 
         m = METRICS
         row = QHBoxLayout(self)
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(m.gap)
 
-        self.read = QPushButton("  " + tr("Read aloud"))
+        self.read = QPushButton()
         self.read.setProperty("variant", "primary")
         self.read.setIcon(icons.icon("play", palette.text_on_accent))
         self.read.setIconSize(icons.icon_size(16))
-        self.read.setAccessibleName(tr("Read aloud"))
         self.read.setShortcut("Ctrl+Return")
-        self.read.setToolTip(tr("Read aloud") + "  (Ctrl+Enter)")
+        remember(self, lambda: self.read.setToolTip(tr("Read aloud") + "  (Ctrl+Enter)"))
+        self._apply_read_text()
         row.addWidget(self.read)
 
         self.pause = tool_button("pause", palette)
@@ -355,7 +444,7 @@ class TransportBar(QWidget):
 
         self.position = QSlider(Qt.Orientation.Horizontal)
         self.position.setRange(0, 0)
-        self.position.setAccessibleName(tr("Playback position"))
+        remember(self, lambda: self.position.setAccessibleName(tr("Playback position")))
         self.position.setEnabled(False)
         row.addWidget(self.position, 1)
 
@@ -399,14 +488,25 @@ class TransportBar(QWidget):
         cancelling the owner's way to reclaim the slot, so it belongs on
         the button the eye already goes to.
         """
-        if generating:
-            self.read.setText("  " + tr("Cancel generation"))
-            self.read.setIcon(icons.icon("close", self._palette.text_on_accent))
-            self.read.setAccessibleName(tr("Cancel generation"))
-        else:
-            self.read.setText("  " + tr("Read aloud"))
-            self.read.setIcon(icons.icon("play", self._palette.text_on_accent))
-            self.read.setAccessibleName(tr("Read aloud"))
+        self._generating = generating
+        self._apply_read_text()
+
+    def _apply_read_text(self) -> None:
+        """Word the primary button for the state it is actually in.
+
+        The source string follows ``_generating`` rather than being set
+        once, so a language switch mid-job re-words the button to
+        *cancel* rather than to *read* (F-86).
+        """
+        source = "Cancel generation" if self._generating else "Read aloud"
+        self.read.setText("  " + tr(source))
+        self.read.setAccessibleName(tr(source))
+        glyph = "close" if self._generating else "play"
+        self.read.setIcon(icons.icon(glyph, self._palette.text_on_accent))
+
+    def retranslate(self) -> None:
+        apply_translations(self)
+        self._apply_read_text()
 
     def set_playback_state(self, state: JobState | str, *, playing: bool) -> None:
         name = "pause" if playing else "play"

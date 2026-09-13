@@ -8,6 +8,8 @@ what happened to the application behind them.
 
 from __future__ import annotations
 
+import time
+
 import pytest
 from PySide6.QtWidgets import QApplication
 
@@ -145,14 +147,53 @@ def test_cleanup_reports_what_it_did(window, settings) -> None:
 # ------------------------------------------------------------------ F-75 ---
 
 
-def test_the_version_check_says_it_cannot_rather_than_nothing(window, settings) -> None:
-    """F-75 queries only at the user's request and installs nothing. This
-    build has no updater, so the honest answer is that the check is
-    unavailable -- silence would read as 'you are up to date'."""
+def _await(reported: list, qt) -> None:
+    """Wait for one answer to land on the GUI thread.
+
+    The check queries off the main thread (rule 7) and hands the answer
+    back through a queued signal, so ``emit`` returns before anything is
+    reported.  This waits for the hand-off, not the network: the module
+    under the window is stubbed in every caller here.
+    """
+    deadline = time.monotonic() + 5
+    while not reported and time.monotonic() < deadline:
+        qt.processEvents()
+        time.sleep(0.01)
+    assert reported, "the answer never reached the screen"
+
+
+def test_the_version_check_carries_the_answer_back_to_the_screen(
+    window, settings, monkeypatch, qt
+) -> None:
+    """F-75 queries only at the user's request and installs nothing."""
+    from echoact import update
+
     screen, _shown = settings
+    monkeypatch.setattr(update, "latest_released_version", lambda **kw: "9.9.9")
     reported: list[tuple] = []
     screen.set_released_version = lambda v, **kw: reported.append((v, kw))
     screen.version_check_requested.emit()
-    assert reported
+    _await(reported, qt)
+    assert reported[0][0] == "9.9.9"
+    assert not reported[0][1].get("error")
+
+
+def test_a_failed_version_check_says_why_rather_than_nothing(
+    window, settings, monkeypatch, qt
+) -> None:
+    """Silence would read as 'you are up to date', so a failed check
+    arrives as an explanation of the failure instead."""
+    from echoact import update
+    from echoact.errors import Code, EchoActError
+
+    def refuse(**_kw: object) -> str:
+        raise EchoActError(Code.RELEASE_FEED_UNREACHABLE, "the feed refused")
+
+    screen, _shown = settings
+    monkeypatch.setattr(update, "latest_released_version", refuse)
+    reported: list[tuple] = []
+    screen.set_released_version = lambda v, **kw: reported.append((v, kw))
+    screen.version_check_requested.emit()
+    _await(reported, qt)
     assert reported[0][0] is None
-    assert reported[0][1].get("error")
+    assert "refused" in reported[0][1].get("error", "")

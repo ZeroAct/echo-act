@@ -70,6 +70,11 @@ class Code(StrEnum):
     MODEL_LICENSE_NOT_ACCEPTED = "MODEL_LICENSE_NOT_ACCEPTED"
     MODEL_OVER_BUDGET = "MODEL_OVER_BUDGET"
 
+    # F-75's version query.  It is the one network request the app makes on
+    # its owner's behalf, and a failed answer is a state of the About
+    # screen, never a crash: hence a code of its own rather than INTERNAL.
+    RELEASE_FEED_UNREACHABLE = "RELEASE_FEED_UNREACHABLE"
+
     # -- execution (F-23, F-47, N-23) ------------------------------------
     BUSY = "BUSY"
     RATE_LIMITED = "RATE_LIMITED"
@@ -170,6 +175,9 @@ _CATALOGUE: dict[Code, tuple[int, bool, str]] = {
         "The model's licence terms have not been accepted.",
     ),
     Code.MODEL_OVER_BUDGET: (422, False, "The model cannot run within the current resource budget."),
+    # Retryable in the F-57 sense -- a later check can succeed -- though it
+    # is never answered over the API, only shown on the About screen.
+    Code.RELEASE_FEED_UNREACHABLE: (502, True, "The released version could not be checked."),
     Code.BUSY: (409, True, "A generation job is already running."),
     Code.RATE_LIMITED: (429, True, "Too many requests."),
     Code.INSUFFICIENT_RESOURCES: (503, True, "There is not enough free memory to start."),

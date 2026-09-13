@@ -90,7 +90,7 @@ from ..policy import (
     VOICE_PRESET_MAX,
 )
 from ..security.credentials import Credential, CredentialStatus
-from . import icons
+from . import brand, icons
 from .controls import guard_wheel
 from .i18n import add_korean, bytes_size, memory_size, on_change, tr
 from .theme import METRICS, Palette
@@ -714,6 +714,36 @@ class SettingsView(QScrollArea):
         )
         lb.setAccessibleName(f"{AUTHOR} — {AUTHOR_GITHUB_URL}")
         return lb
+
+    def _brand_lockup(self) -> QWidget:
+        """The mark, the name, and the name in Korean: a product, not a form.
+
+        Set once and not recorded through :meth:`_text` -- the wordmark is
+        "EchoAct" in both languages and the hangul line is its reading, so
+        there is nothing to translate and everything to be confused by if
+        a future language translated them.
+        """
+        row = QWidget()
+        line = QHBoxLayout(row)
+        line.setContentsMargins(0, 0, 0, 0)
+        line.setSpacing(METRICS.gap_wide)
+        tile = QLabel()
+        tile.setPixmap(
+            brand.tile_pixmap(44, self._palette.accent, self._palette.text_on_accent, dpr=2.0)
+        )
+        tile.setAccessibleName("EchoAct")
+        line.addWidget(tile)
+        names = QVBoxLayout()
+        names.setSpacing(0)
+        name = QLabel("EchoAct")
+        name.setProperty("role", "title")
+        names.addWidget(name)
+        hangul = QLabel("에코액트")
+        hangul.setProperty("role", "muted")
+        names.addWidget(hangul)
+        line.addLayout(names)
+        line.addStretch(1)
+        return row
 
     def _value_label(self, role: str | None = "secondary") -> QLabel:
         lb = QLabel()
@@ -2007,6 +2037,7 @@ class SettingsView(QScrollArea):
 
     def _build_about(self) -> QFrame:
         panel, box = self._panel("About")
+        box.addWidget(self._brand_lockup())
         box.addWidget(self._label("Installed version {version}", "secondary", version=__version__))
 
         self.check_version = self._button("Check for a released version")

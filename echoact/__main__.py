@@ -53,13 +53,29 @@ def main(argv: list[str] | None = None) -> int:
     from PySide6.QtWidgets import QApplication
 
     from .app import Application
-    from .ui import theme
+    from .ui import brand, theme
     from .ui.main_window import MainWindow
+
+    if sys.platform == "win32":
+        # The taskbar attributes its button to the *launcher process*, not
+        # to Qt: run through a script shim and the button wears Python's
+        # logo however good the window icon is (that only reaches the title
+        # bar).  Declaring an application identity makes the button ours.
+        import ctypes
+
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("com.echoact.app")
+        except OSError:  # pragma: no cover - a stripped shell must not stop the app
+            pass
 
     QApplication.setAttribute(Qt.ApplicationAttribute.AA_DontCreateNativeWidgetSiblings, True)
     qt = QApplication(argv)
     qt.setApplicationName("EchoAct")
     qt.setOrganizationName("EchoAct")
+    # The face in the taskbar and Alt-Tab: the brand on its tile, in the
+    # theme the window is about to resolve to.  Set on the application so
+    # every dialog inherits it rather than wearing Qt's generic logo.
+    qt.setWindowIcon(brand.app_icon(theme.palette_for(theme.Mode.SYSTEM)))
 
     # Before anything measures a glyph: a face registered later would not
     # be the one the first layout used, and N-13's stability is about the

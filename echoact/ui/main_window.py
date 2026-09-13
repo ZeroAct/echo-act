@@ -14,9 +14,10 @@ to remember.
 from __future__ import annotations
 
 import threading
+import weakref
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QCloseEvent, QKeySequence
 from PySide6.QtWidgets import (
     QDialog,
@@ -35,6 +36,7 @@ from PySide6.QtWidgets import (
 from ..app import Application
 from ..audio import wav
 from ..audio.player import PlayerState, Timeline
+from ..config.settings import DisplayLanguage
 from ..domain import JobState, RequestPath, RetentionMode, VoiceSettings
 from ..errors import Code, EchoActError
 from ..jobs.engine import Event
@@ -46,9 +48,17 @@ from ..util import ids
 from ..util.logging import get_logger
 from . import icons
 from .bridge import EngineBridge, PlayRequestBridge
-from .controls import TransportBar, VoicePanel, label, tool_button
+from .controls import (
+    TransportBar,
+    VoicePanel,
+    apply_translations,
+    is_alive,
+    label,
+    remember,
+    tool_button,
+)
 from .external_play import ExternalPlayback
-from .i18n import add_korean, approximate_duration, count, tr
+from .i18n import add_korean, approximate_duration, count, on_change, tr
 from .licence import LicenceDialog
 from .notifications import (
     Level,
@@ -88,8 +98,6 @@ add_korean(
         "Storage": "저장 공간",
         "{n} items cleaned up": "{n}개 항목을 정리했습니다",
         "Some items could not be deleted": "일부 항목을 삭제하지 못했습니다",
-        "EchoAct cannot check for a newer version in this build.":
-            "이 빌드에서는 새 버전을 확인할 수 없습니다.",
         "Text files (*.txt *.md);;All files (*)": "텍스트 파일 (*.txt *.md);;모든 파일 (*)",
         "Save audio": "오디오 저장",
         "WAV audio (*.wav)": "WAV 오디오 (*.wav)",
@@ -114,6 +122,22 @@ add_korean(
 )
 
 
+class _Answers(QObject):
+    """Carries one background answer onto the GUI thread.
+
+    ``bridge.py`` owns that hand-off for engine events; this is the same
+    rule for the window's own one-shot questions.  A signal, and not
+    ``QTimer.singleShot``: fired from a thread with no event loop, a
+    zero-interval timer never fires at all (measured, not guessed) --
+    which is how the F-73 storage figures came to be computed and
+    silently dropped.
+    """
+
+    #: A callable to run; emitting it from a worker thread queues it to
+    #: this object's thread, which is the GUI one.
+    answered = Signal(object)
+
+
 class MainWindow(QMainWindow):
     """One window, one job at a time, one reading position."""
 
@@ -130,12 +154,19 @@ class MainWindow(QMainWindow):
         self.resize(1180, 780)
         self.setMinimumSize(900, 560)
 
+        self._answers = _Answers(self)
+        self._answers.answered.connect(lambda run: run())
+
         self._job_id: str | None = None
         self._timeline: Timeline | None = None
         self._snapshot: str = ""
         self._started_playback = False
         self._external_notice = False
         self._entry = MANIFEST.get(app.settings.voice.model_id)
+        #: The last source strings of the lines the window computes rather
+        #: than the window shows, so F-86 can re-render them in place.
+        self._status_source: tuple[str, dict[str, object]] = ("Ready to read", {})
+        self._counter_count: int | None = None
 
         self._build()
         self._wire()
@@ -143,7 +174,9 @@ class MainWindow(QMainWindow):
         self._refresh_estimate()
         self._refresh_resources()
         self._update_enabled()
-        self._set_status(tr("Ready to read"))
+        self._set_status("Ready to read")
+
+        self._watch_language()
 
         self._tick = QTimer(self)
         self._tick.setInterval(TICK_MS)
@@ -172,11 +205,13 @@ class MainWindow(QMainWindow):
         self.model_chip = label("", "muted")
         head.addWidget(self.model_chip)
         head.addStretch(1)
-        self.open_button = QPushButton("  " + tr("Open file"))
+        self.open_button = QPushButton()
+        remember(self, lambda: self.open_button.setText("  " + tr("Open file")))
         self.open_button.setProperty("variant", "quiet")
         self.open_button.setIcon(icons.icon("folder", p.text_secondary, p.text_muted))
         self.open_button.setIconSize(icons.icon_size(16))
-        self.save_button = QPushButton("  " + tr("Save audio"))
+        self.save_button = QPushButton()
+        remember(self, lambda: self.save_button.setText("  " + tr("Save audio")))
         self.save_button.setProperty("variant", "quiet")
         self.save_button.setIcon(icons.icon("export", p.text_secondary, p.text_muted))
         self.save_button.setIconSize(icons.icon_size(16))
@@ -185,18 +220,23 @@ class MainWindow(QMainWindow):
 
         head.addSpacing(METRICS.gap)
         self.nav: dict[str, QPushButton] = {}
-        for key, name, glyph in (
-            ("library", tr("Library"), "library"),
-            ("models", tr("Models"), "cube"),
-            ("connect", tr("Connect an app"), "plug"),
-            ("status", tr("Activity"), "pulse"),
-            ("settings", tr("Settings"), "settings"),
+        for key, source, glyph in (
+            ("library", "Library", "library"),
+            ("models", "Models", "cube"),
+            ("connect", "Connect an app", "plug"),
+            ("status", "Activity", "pulse"),
+            ("settings", "Settings", "settings"),
         ):
-            b = QPushButton("  " + name)
+            b = QPushButton()
             b.setProperty("variant", "quiet")
             b.setIcon(icons.icon(glyph, p.text_secondary, p.text_muted))
             b.setIconSize(icons.icon_size(16))
-            b.setAccessibleName(name)
+
+            def word(button: QPushButton = b, name: str = source) -> None:
+                button.setText("  " + tr(name))
+                button.setAccessibleName(tr(name))
+
+            remember(self, word)
             head.addWidget(b)
             self.nav[key] = b
         outer.addLayout(head)
@@ -232,7 +272,8 @@ class MainWindow(QMainWindow):
         self.estimate_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         meta.addWidget(self.counter)
         meta.addStretch(1)
-        self.follow_button = QPushButton("  " + tr("Return to the reading position"))
+        self.follow_button = QPushButton()
+        remember(self, lambda: self.follow_button.setText("  " + tr("Return to the reading position")))
         self.follow_button.setProperty("variant", "quiet")
         self.follow_button.setIcon(icons.icon("locate", p.accent))
         self.follow_button.setIconSize(icons.icon_size(14))
@@ -273,21 +314,20 @@ class MainWindow(QMainWindow):
     def _build_menu(self) -> None:
         """Menu entries exist so every action has a keyboard route (N-30),
         not because the window needs a menu."""
-        actions = (
-            (tr("Open file"), QKeySequence.StandardKey.Open, self._open_file),
-            (tr("Save audio"), QKeySequence.StandardKey.Save, self._save_audio),
-            (tr("Read aloud"), QKeySequence("Ctrl+Return"), self._primary_action),
-            (tr("Play"), QKeySequence("Space"), None),
-            (tr("Stop"), QKeySequence("Ctrl+."), self._stop),
-            (tr("Return to the reading position"), QKeySequence("Ctrl+J"), self._return_to_position),
-        )
-        for name, shortcut, slot in actions:
-            if slot is None:
-                continue
-            action = QAction(name, self)
+        for source, shortcut, slot in (
+            ("Open file", QKeySequence.StandardKey.Open, self._open_file),
+            ("Save audio", QKeySequence.StandardKey.Save, self._save_audio),
+            ("Read aloud", QKeySequence("Ctrl+Return"), self._primary_action),
+            ("Stop", QKeySequence("Ctrl+."), self._stop),
+            ("Return to the reading position", QKeySequence("Ctrl+J"), self._return_to_position),
+        ):
+            # "Play" has no entry of its own: Space is handled by the
+            # reading surface, and a QAction would swallow the keystroke.
+            action = QAction("", self)
             action.setShortcut(shortcut)
             action.triggered.connect(slot)
             self.addAction(action)
+            remember(self, lambda a=action, s=source: a.setText(tr(s)))
 
     def _wire(self) -> None:
         self.notifications = NotificationCentre(
@@ -343,10 +383,16 @@ class MainWindow(QMainWindow):
         self.reading.set_follow(s.follow)
         self.app.player.set_volume(s.volume)
         self.app.player.set_muted(s.muted)
-        state = self.app.registry.status(s.voice.model_id)
+        self._render_model_chip()
+
+    def _render_model_chip(self) -> None:
+        """The header chip.  A method because F-86 repaints it too: part
+        of it ("not prepared") is prose, and prose changes language."""
+        state = self.app.registry.status(self.app.settings.voice.model_id)
         ready = getattr(state, "state", None)
+        rate = self._entry.sample_rate
         self.model_chip.setText(
-            f"{self._entry.display_name} · {self._entry.sample_rate // 1000}.{(self._entry.sample_rate // 100) % 10} kHz"
+            f"{self._entry.display_name} · {rate // 1000}.{(rate // 100) % 10} kHz"
             + ("" if str(ready) == "ready" else " · " + tr("not prepared"))
         )
 
@@ -398,7 +444,7 @@ class MainWindow(QMainWindow):
         self.progress.setValue(0)
         self._update_enabled()
         if not created:
-            self._set_status(tr("Ready to read"))
+            self._set_status("Ready to read")
 
     def _licence_accepted(self) -> bool:
         """N-11 and F-80: the terms are presented before first preparation.
@@ -430,19 +476,19 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _on_accepted(self, event: Event) -> None:
-        self._set_status(tr("Preparing the model"))
+        self._set_status("Preparing the model")
         self._update_enabled()
 
     def _on_state(self, event: Event) -> None:
         if event.job_id != self._job_id:
             return
         text = {
-            JobState.PREPARING_MODEL: tr("Preparing the model"),
-            JobState.GENERATING: tr("Generating"),
-            JobState.COMPLETE: tr("Finished"),
-            JobState.CANCELING: tr("Cancel generation"),
-            JobState.CANCELED: tr("Generation canceled"),
-            JobState.FAILED: tr("Failed"),
+            JobState.PREPARING_MODEL: "Preparing the model",
+            JobState.GENERATING: "Generating",
+            JobState.COMPLETE: "Finished",
+            JobState.CANCELING: "Cancel generation",
+            JobState.CANCELED: "Generation canceled",
+            JobState.FAILED: "Failed",
         }.get(event.state or JobState.ACCEPTED, "")
         self._set_status(text)
         self._update_enabled()
@@ -474,9 +520,7 @@ class MainWindow(QMainWindow):
 
         if event.total:
             self.progress.setValue(int(100 * event.generated / event.total))
-            self._set_status(
-                tr("Generating {done} of {total}").format(done=event.generated, total=event.total)
-            )
+            self._set_status("Generating {done} of {total}", done=event.generated, total=event.total)
         if not self._started_playback and self.app.settings.autoplay:
             self._started_playback = True
             self._play()
@@ -562,7 +606,7 @@ class MainWindow(QMainWindow):
                 title,
                 tr("Your text and reading position are untouched. Stop silences it."),
             )
-            self._set_status(title)
+            self._set_status("Playing a request from {client}", client=client)
         else:
             if self._external_notice:
                 self._external_notice = False
@@ -574,7 +618,7 @@ class MainWindow(QMainWindow):
                 self.app.player.load(self._timeline)
                 self.transport.set_playable(self._timeline.duration_ms)
             self.transport.set_playback_state("", playing=False)
-            self._set_status(tr("Ready to read") if self._job_id is None else "")
+            self._set_status("Ready to read" if self._job_id is None else "")
         self._update_enabled()
 
     def _seek(self, ms: int) -> None:
@@ -610,11 +654,20 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _on_length(self, n: int) -> None:
-        self.counter.setText(
-            tr("{n} / {max} characters").format(n=count(n), max=count(MAX_INPUT_CODEPOINTS))
-        )
+        self._counter_count = n
+        self._render_counter()
         self._refresh_estimate()
         self._update_enabled()
+
+    def _render_counter(self) -> None:
+        """The character count, from the count rather than the sentence."""
+        if self._counter_count is None:
+            return
+        self.counter.setText(
+            tr("{n} / {max} characters").format(
+                n=count(self._counter_count), max=count(MAX_INPUT_CODEPOINTS)
+            )
+        )
 
     def _refresh_estimate(self) -> None:
         """F-88's estimate, shown to the person as well as to a caller.
@@ -827,12 +880,20 @@ class MainWindow(QMainWindow):
         """
         from .settings_view import storage_snapshot
 
+        ref = weakref.ref(screen)
+
         def measure() -> None:
             try:
                 sizes = storage_snapshot(self.app.store, self.app.registry)
             except (EchoActError, OSError):
                 return
-            QTimer.singleShot(0, lambda: screen.set_storage(sizes))
+
+            def deliver() -> None:
+                target = ref()
+                if target is not None and is_alive(target):
+                    target.set_storage(sizes)
+
+            self._answers.answered.emit(deliver)
 
         threading.Thread(target=measure, name="echoact-storage", daemon=True).start()
 
@@ -996,12 +1057,37 @@ class MainWindow(QMainWindow):
 
     def _check_version(self, screen: QWidget) -> None:
         """F-75: queried only at the user's request, and nothing is
-        downloaded or installed.  There is no updater in this build, so
-        the honest answer is that the check is unavailable rather than a
-        silent nothing."""
-        screen.set_released_version(
-            None, error=tr("EchoAct cannot check for a newer version in this build.")
-        )
+        downloaded or installed.
+
+        One GET off the main thread (rule 7), and the answer crosses back
+        through :class:`_Answers` because the widget belongs to this
+        thread -- and only if the screen is still open, because the owner
+        may have moved on, which is a question withdrawn rather than one
+        that failed.
+        """
+        from ..update import latest_released_version
+
+        ref = weakref.ref(screen)
+
+        def ask() -> None:
+            error: str | None = None
+            version: str | None = None
+            try:
+                version = latest_released_version()
+            except EchoActError as exc:
+                error = exc.message
+            self._answers.answered.emit(lambda: self._report_version(ref, version, error))
+
+        threading.Thread(target=ask, name="echoact-version-check", daemon=True).start()
+
+    @staticmethod
+    def _report_version(
+        ref: weakref.ReferenceType[QWidget], version: str | None, error: str | None
+    ) -> None:
+        screen = ref()
+        if screen is None or not is_alive(screen):
+            return
+        screen.set_released_version(version, error=error)
 
     def _show_connect(self) -> None:
         """F-58: the app hands the user what their MCP client needs.
@@ -1112,13 +1198,62 @@ class MainWindow(QMainWindow):
         elif field == "os_notifications":
             self.notifications.set_os_notifications(bool(value))
 
-    def _apply_display_language(self, value: str) -> None:
+    def _apply_display_language(self, value: DisplayLanguage) -> None:
         """F-86.  Only what is shown changes: A-22 requires documents, job
-        snapshots and API responses to be untouched."""
+        snapshots and API responses to be untouched.
+
+        The screen emits the enum, not its string (``settings_view``
+        rebuilds it for exactly this contract), and the enum is coerced
+        rather than trusted because ``Signal(object)`` enforces nothing --
+        a bare ``str`` would survive to the save and fail there, inside
+        serialisation rather than at the door.
+        """
         from .i18n import Lang, set_language
 
-        self.app.update_settings(display_language=value)
-        set_language(Lang(value) if value in {"ko", "en"} else Lang.SYSTEM)
+        language = DisplayLanguage(str(value))
+        self.app.update_settings(display_language=language)
+        set_language(Lang(language))
+
+    def _watch_language(self) -> None:
+        """Re-word this window when the language changes (F-86).
+
+        ``i18n`` keeps its listeners for the life of the process and the
+        test suite builds a dozen windows, so the hook holds a weak
+        reference and checks the C++ object before calling into it --
+        the discipline ``settings_view._follow_language`` applies to its
+        own screen.
+        """
+        ref = weakref.ref(self)
+
+        def hook(_lang: object) -> None:
+            window = ref()
+            if window is None or not is_alive(window):
+                return
+            window._retranslate()
+
+        on_change(hook)
+
+    def _retranslate(self) -> None:
+        """Every string this window shows, re-set from its source (F-86).
+
+        The chrome that never closes re-words here: the header, the
+        transport, the voice panel, and the lines that update live.
+        Dialog screens translate themselves when built and answer in the
+        new language the next time they open; the settings screen re-words
+        itself through its own listener.  Nothing is rebuilt, so the
+        reading position, the scroll, and the focus all survive the
+        switch.
+        """
+        apply_translations(self)
+        self.voice_panel.retranslate()
+        self.transport.retranslate()
+        source, fmt = self._status_source
+        self._set_status(source, **fmt)
+        self._render_counter()
+        self._refresh_estimate()
+        self._render_model_chip()
+        self._refresh_service_label()
+        self._refresh_resources()
 
     def _restart_service(self) -> None:
         """F-79: a port change restarts the service, not the app, and a
@@ -1167,8 +1302,16 @@ class MainWindow(QMainWindow):
         self.save_button.setEnabled(playable)
         self.open_button.setEnabled(not busy)
 
-    def _set_status(self, text: str) -> None:
-        self.status.setText(text)
+    def _set_status(self, source: str, **fmt: object) -> None:
+        """Show a status line from its English source, not its rendering.
+
+        The source and arguments are kept because a language switch
+        repaints this line too (F-86): a status frozen in whichever
+        language it happened to arrive in would be the one line on the
+        screen disagreeing with every other one.
+        """
+        self._status_source = (source, fmt)
+        self.status.setText(tr(source).format(**fmt) if fmt else tr(source))
 
     def _refresh_resources(self) -> None:
         """F-78 shows the configured value; the job shows what it ran under.

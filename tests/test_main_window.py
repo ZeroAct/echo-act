@@ -193,7 +193,69 @@ def test_the_window_can_be_built_in_korean(app, qt, tmp_path) -> None:
         i18n.set_language(i18n.Lang.EN)
 
 
-# ------------------------------------------------------------- F-89 ---
+def test_switching_language_rewords_the_window_that_is_already_open(app, qt) -> None:
+    """The reported bug: choosing another display language saved the new
+    choice, and every line already on the screen kept speaking the old one
+    until the next restart (F-86)."""
+    from echoact.config.settings import DisplayLanguage
+    from echoact.ui.main_window import MainWindow
+
+    theme.apply(qt, theme.Mode.LIGHT)
+    w = MainWindow(app, theme.Mode.LIGHT)
+    w.grab()
+    try:
+        assert "Read aloud" in w.transport.read.text()
+        assert "Settings" in w.nav["settings"].text()
+        assert "Ready to read" in w.status.text()
+
+        # The enum, as the settings screen emits it -- not its string.
+        w._apply_display_language(DisplayLanguage.KO)
+        assert "소리내어" in w.transport.read.text()
+        assert "설정" in w.nav["settings"].text()
+        assert "읽을 준비" in w.status.text()
+
+        # Re-wording must re-word, not rebuild: the chosen style is the
+        # proof, because a rebuild would reset it silently.
+        w.voice_panel.style.setCurrentIndex(2)  # Bright
+        w._apply_display_language(DisplayLanguage.EN)
+        assert "Read aloud" in w.transport.read.text()
+        assert w.voice_panel.style.currentData() == SpeakingStyle.BRIGHT
+        assert "밝게" not in w.voice_panel.style.itemText(2)
+    finally:
+        i18n.set_language(i18n.Lang.EN)
+        w._tick.stop()
+        w.bridge.detach()
+
+
+def test_a_status_set_while_generating_survives_the_switch_in_its_state(app, qt) -> None:
+    """A status is re-rendered from its source, so a line set mid-job
+    re-words to *the thing actually happening* rather than to a stale
+    sentence -- and the transport button says *cancel*, not *read*, in
+    the new language too (F-86)."""
+    from echoact.config.settings import DisplayLanguage
+    from echoact.domain import JobState
+    from echoact.jobs.engine import Event, EventKind
+    from echoact.ui.main_window import MainWindow
+
+    theme.apply(qt, theme.Mode.LIGHT)
+    w = MainWindow(app, theme.Mode.LIGHT)
+    w.grab()
+    try:
+        w._job_id = "job-1"
+        w._on_state(Event(kind=EventKind.STATE, job_id="job-1", state=JobState.GENERATING))
+        assert "Generating" in w.status.text()
+        # The engine here is idle, so _update_enabled would keep the button
+        # on *read*; the flag is what carries the job's state to the button,
+        # so it is set the way a busy engine would set it.
+        w.transport.set_generating(True)
+        assert "Cancel generation" in w.transport.read.text()
+        w._apply_display_language(DisplayLanguage.KO)
+        assert "생성 취소" in w.transport.read.text()
+        assert "생성 중" in w.status.text()
+    finally:
+        i18n.set_language(i18n.Lang.EN)
+        w._tick.stop()
+        w.bridge.detach()
 
 
 def _external_job(app, text: str = "클라이언트가 요청한 문장입니다.") -> str:
