@@ -179,6 +179,10 @@ MCP_PROTOCOL_REVISION: Final = "2026-07-28"
 VOICE_PRESET_MAX: Final = 100  # 4.1
 PLAYBACK_VOLUME_DEFAULT: Final = 1.0
 OS_NOTIFICATIONS_DEFAULT: Final = False
+#: Closing the window hides EchoAct to the tray rather than quitting, so a
+#: job keeps running.  On because it is the Windows convention; the first
+#: hide explains itself with a tray message, and Settings can turn it off.
+CLOSE_TO_TRAY_DEFAULT: Final = True
 AUTOPLAY_DEFAULT: Final = True  # F-83
 EXTERNAL_PLAY_DEFAULT: Final = True  # F-89
 # F-57 wants a hint a client can honour rather than guess at.  The figure is

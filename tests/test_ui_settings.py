@@ -266,6 +266,21 @@ def test_showing_remembered_settings_emits_nothing(app: QApplication) -> None:
     assert view.memory.value() == pytest.approx(3.0)
 
 
+def test_the_tray_and_notice_toggles_reflect_and_emit(app: QApplication) -> None:
+    """The F-70 row the pairs table has always named, and the tray's own."""
+    view, _ = make_view(app)
+    seen_tray = capture(view.close_to_tray_changed)
+    seen_notice = capture(view.os_notifications_changed)
+    view.apply(Settings(close_to_tray=False, os_notifications=True))
+    assert seen_tray == [] and seen_notice == []
+    assert view.close_to_tray.isChecked() is False
+    assert view.os_notifications.isChecked() is True
+    view.close_to_tray.toggle()
+    view.os_notifications.toggle()
+    assert seen_tray == [True]
+    assert seen_notice == [False]
+
+
 def test_the_applied_budget_is_shown_apart_from_the_configured_one(app: QApplication) -> None:
     view, _ = make_view(app, Settings(cpu_percent=60, memory_bytes=6 * GIB))
     view.set_resource_state(

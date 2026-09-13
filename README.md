@@ -99,6 +99,25 @@ tests/            pytest. `-m engine` needs the model; the rest does not.
 
 `CLAUDE.md` is the contributor's short version.
 
+## Publishing a release (maintainers)
+
+PyPI never accepts the same version twice, so bump `version` in
+`pyproject.toml` first, then:
+
+```
+uv build                        # sdist + wheel into dist/
+uvx twine check dist/*          # README and metadata render correctly
+uv publish                      # uploads dist/ to PyPI
+```
+
+`uv publish` authenticates with an API token from pypi.org (Account → API
+tokens): set it as `UV_PUBLISH_TOKEN` before the command, or answer the
+username prompt with `__token__` and the token as the password.
+
+To try the upload without touching the real index, add
+`--publish-url https://test.pypi.org/legacy/` and install afterwards with
+`uvx --index-url https://test.pypi.org/simple/ echoact`.
+
 ## Author
 
 Huijae Lee (ZeroAct) — lhj56822@gmail.com — [github.com/ZeroAct](https://github.com/ZeroAct)

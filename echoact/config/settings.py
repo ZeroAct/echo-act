@@ -56,6 +56,7 @@ from ..paths import redact, settings_path
 from ..policy import (
     AUTOPLAY_DEFAULT,
     AUTOSAVE_DOCUMENTS_DEFAULT,
+    CLOSE_TO_TRAY_DEFAULT,
     CPU_PERCENT_DEFAULT,
     CPU_PERCENT_MAX,
     CPU_PERCENT_MIN,
@@ -295,6 +296,9 @@ class Settings:
     # -- presentation (F-86, 4.1) -----------------------------------------
     display_language: DisplayLanguage = field(default_factory=_default_display_language)
     os_notifications: bool = OS_NOTIFICATIONS_DEFAULT
+    #: Closing the window hides it to the tray when a tray exists; jobs keep
+    #: running.  Quitting stays an explicit act (tray menu, or Settings off).
+    close_to_tray: bool = CLOSE_TO_TRAY_DEFAULT
 
     # -- integrations (4.1, F-46) -----------------------------------------
     rest_enabled: bool = REST_ENABLED_DEFAULT
@@ -460,6 +464,7 @@ class Settings:
             "output_device": self.output_device,
             "display_language": self.display_language.value,
             "os_notifications": self.os_notifications,
+            "close_to_tray": self.close_to_tray,
             "rest_enabled": self.rest_enabled,
             "rest_port": self.rest_port,
             "mcp_enabled": self.mcp_enabled,
@@ -555,6 +560,12 @@ class Settings:
                     "os_notifications",
                     problems,
                 ),
+                close_to_tray=_read_bool(
+                    d.get("close_to_tray"),
+                    defaults.close_to_tray,
+                    "close_to_tray",
+                    problems,
+                ),
                 rest_enabled=_read_bool(
                     d.get("rest_enabled"), defaults.rest_enabled, "rest_enabled", problems
                 ),
@@ -632,6 +643,7 @@ _KNOWN_KEYS: Final[frozenset[str]] = frozenset(
         "output_device",
         "display_language",
         "os_notifications",
+        "close_to_tray",
         "rest_enabled",
         "rest_port",
         "mcp_enabled",

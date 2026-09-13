@@ -31,10 +31,19 @@ def _spec_suffixes() -> set[str]:
 
 
 def _runtime_suffixes() -> set[str]:
+    # The fonts directory is the spec's one whole-directory copy
+    # (``font_data`` ships everything under it, whatever the suffix), so
+    # scanning it would flag files that a build plainly does contain.
+    # Nothing else ships that way, and no suffix goes unexamined: any file
+    # added elsewhere still has to name its suffix in the collector.
+    fonts = PACKAGE / "assets" / "fonts"
     return {
         path.suffix.lower()
         for path in PACKAGE.rglob("*")
-        if path.is_file() and path.suffix != ".py" and "__pycache__" not in path.parts
+        if path.is_file()
+        and path.suffix != ".py"
+        and "__pycache__" not in path.parts
+        and fonts not in path.parents
     }
 
 

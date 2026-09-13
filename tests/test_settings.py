@@ -29,6 +29,7 @@ from echoact.domain import Budget, Gender, Language, SpeakingStyle, VoiceSetting
 from echoact.errors import Code, EchoActError
 from echoact.policy import (
     AUTOPLAY_DEFAULT,
+    CLOSE_TO_TRAY_DEFAULT,
     CPU_PERCENT_DEFAULT,
     CREDENTIAL_DAYS_DEFAULT,
     FOLLOW_DEFAULT,
@@ -82,6 +83,7 @@ def test_defaults_match_the_documented_first_launch_policy() -> None:
     assert s.follow is FOLLOW_DEFAULT is True
     assert (s.volume, s.muted, s.output_device) == (1.0, False, None)
     assert s.os_notifications is False
+    assert s.close_to_tray is CLOSE_TO_TRAY_DEFAULT is True
     assert (s.rest_enabled, s.rest_port, s.mcp_enabled) == (True, REST_PORT_DEFAULT, True)
     assert s.external_play is True  # F-89
     assert s.credential_days == CREDENTIAL_DAYS_DEFAULT
@@ -107,6 +109,7 @@ def test_every_remembered_setting_survives_a_save_and_reload() -> None:
         output_device=output_device_key("MME", "Speakers (Realtek)"),
         display_language=DisplayLanguage.KO,
         os_notifications=True,
+        close_to_tray=False,
         rest_enabled=False,
         rest_port=9100,
         mcp_enabled=False,

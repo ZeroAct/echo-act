@@ -53,6 +53,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSlider,
     QSpinBox,
+    QSystemTrayIcon,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -178,6 +179,10 @@ add_korean(
         "Changing the display language does not change your documents, saved jobs, "
         "or what the local service answers.":
             "표시 언어를 바꿔도 문서, 저장된 작업, 로컬 서비스의 응답은 바뀌지 않습니다.",
+        "Keep running in the tray": "창을 닫아도 트레이에서 계속 실행",
+        "Closing the window then hides EchoAct beside the clock; jobs keep running.":
+            "창을 닫으면 EchoAct가 시계 옆 트레이로 숨겨지고, 작업은 계속 실행됩니다.",
+        "Notify me with a system message": "시스템 메시지로 알림",
         # -- integrations ---------------------------------------------------
         "Integrations": "연동",
         "Local REST service": "로컬 REST 서비스",
@@ -526,6 +531,12 @@ class SettingsView(QScrollArea):
     #: ``Settings.to_dict`` when saving, and ``_render_languages`` here --
     #: raises.  F-86 would then neither persist nor retranslate.
     display_language_changed = Signal(object)
+    #: Closing the window hides it to the tray instead of quitting.
+    close_to_tray_changed = Signal(bool)
+    #: F-70's other half: mirror notices to the tray icon.  The pairs table
+    #: in ``MainWindow._connect_settings`` has named this signal since it
+    #: was written; the row that emits it is only now here.
+    os_notifications_changed = Signal(bool)
 
     # -- integrations (F-46, F-71, F-79) ------------------------------------
     rest_enabled_changed = Signal(bool)
@@ -1175,10 +1186,28 @@ class SettingsView(QScrollArea):
         box.addWidget(self.autoplay)
         box.addWidget(self.follow)
 
+        # Both rows speak for the tray icon; with no tray on this machine
+        # there is nothing for either to mean, so neither is shown rather
+        # than one shown and inert.
+        has_tray = QSystemTrayIcon.isSystemTrayAvailable()
+        self.close_to_tray = self._check("Keep running in the tray")
+        self.tray_note = self._label(
+            "Closing the window then hides EchoAct beside the clock; jobs keep running.",
+            "muted",
+        )
+        self.os_notifications = self._check("Notify me with a system message")
+        box.addWidget(self.close_to_tray)
+        box.addWidget(self.tray_note)
+        box.addWidget(self.os_notifications)
+        for row in (self.close_to_tray, self.tray_note, self.os_notifications):
+            row.setVisible(has_tray)
+
         self._render_languages()
         self.language.currentIndexChanged.connect(self._on_language)
         self.autoplay.toggled.connect(self._on_autoplay)
         self.follow.toggled.connect(self._on_follow)
+        self.close_to_tray.toggled.connect(self._on_close_to_tray)
+        self.os_notifications.toggled.connect(self._on_os_notifications)
         return panel
 
     def _render_languages(self) -> None:
@@ -1209,6 +1238,14 @@ class SettingsView(QScrollArea):
     def _on_follow(self, checked: bool) -> None:
         if not self._loading:
             self.follow_changed.emit(bool(checked))
+
+    def _on_close_to_tray(self, checked: bool) -> None:
+        if not self._loading:
+            self.close_to_tray_changed.emit(bool(checked))
+
+    def _on_os_notifications(self, checked: bool) -> None:
+        if not self._loading:
+            self.os_notifications_changed.emit(bool(checked))
 
     # ==================================================================
     # Integrations (F-46, F-71, F-79, N-31, 4.1)
@@ -2122,6 +2159,8 @@ class SettingsView(QScrollArea):
             self.muted.setChecked(settings.muted)
             self.autoplay.setChecked(settings.autoplay)
             self.follow.setChecked(settings.follow)
+            self.close_to_tray.setChecked(settings.close_to_tray)
+            self.os_notifications.setChecked(settings.os_notifications)
             self.rest.setChecked(settings.rest_enabled)
             self.port.setValue(
                 max(MIN_USER_PORT, min(MAX_PORT, settings.rest_port))

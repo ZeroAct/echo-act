@@ -20,6 +20,7 @@ from pathlib import Path
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QCloseEvent, QKeySequence
 from PySide6.QtWidgets import (
+    QApplication,
     QDialog,
     QFileDialog,
     QFrame,
@@ -46,7 +47,7 @@ from ..policy import MAX_INPUT_CODEPOINTS
 from ..text.loader import load_file
 from ..util import ids
 from ..util.logging import get_logger
-from . import icons
+from . import brand, icons
 from .bridge import EngineBridge, PlayRequestBridge
 from .controls import (
     TransportBar,
@@ -66,10 +67,12 @@ from .notifications import (
     NotificationCentre,
     completion_notice,
     failure_notice,
+    tray_sink,
 )
 from .reading import ReadingSurface
 from .theme import METRICS, Mode, Palette
 from .theme import apply as apply_theme
+from .tray import TrayController, build_tray
 
 log = get_logger("ui.window")
 
@@ -115,6 +118,10 @@ add_korean(
         "This file covers {percent}% of the text.": "이 파일은 본문의 {percent}%를 담고 있습니다.",
         "Line endings were normalised.": "줄바꿈 문자를 정규화했습니다.",
         "Playing a request from {client}": "{client}의 요청을 재생하는 중",
+        "EchoAct is still running": "EchoAct이 계속 실행 중입니다",
+        "Close sent EchoAct to the system tray. Double-click the icon to bring it back.":
+            "창을 닫아도 EchoAct은 시스템 트레이에서 실행을 계속합니다. "
+            "아이콘을 두 번 누르면 다시 나타납니다.",
         "an app": "어떤 앱",
         "Your text and reading position are untouched. Stop silences it.":
             "입력한 본문과 읽는 위치는 그대로입니다. 정지를 누르면 소리가 멈춥니다.",
@@ -330,8 +337,21 @@ class MainWindow(QMainWindow):
             remember(self, lambda a=action, s=source: a.setText(tr(s)))
 
     def _wire(self) -> None:
+        self.tray: TrayController | None = build_tray(self, brand.app_icon(self.palette_tokens))
+        self._tray_hinted = False
+        if self.tray is not None:
+            # With the window hideable, closing it is no longer an intent to
+            # quit -- only the tray's Quit is.  Set only when a tray exists,
+            # so a session without one keeps stock quit-on-last-window-closed.
+            QApplication.instance().setQuitOnLastWindowClosed(False)
+            self.tray.show_requested.connect(self.show_from_tray)
+            self.tray.stop_requested.connect(self._stop)
+            self.tray.quit_requested.connect(self._quit_from_tray)
+        # F-70's OS notices finally have somewhere to go: tray_sink was
+        # written for this icon and had never been given one.
         self.notifications = NotificationCentre(
-            os_notifications=self.app.settings.os_notifications
+            os_notifications=self.app.settings.os_notifications,
+            os_sink=tray_sink(self.tray.icon) if self.tray is not None else None,
         )
         self.bridge = EngineBridge(self.app.engine, self)
         self.bridge.accepted.connect(self._on_accepted)
@@ -628,6 +648,11 @@ class MainWindow(QMainWindow):
             self.transport.set_position(self.app.player.position_ms())
 
     def _on_tick(self) -> None:
+        if self.tray is not None:
+            # The tooltip is the only status a hidden app can show, and the
+            # status line is already the plain-language summary of the job.
+            status = self.status.text()
+            self.tray.set_tooltip(f"EchoAct — {status}" if status else "EchoAct")
         player = self.app.player
         self.external.poll()
         if self.external.active:
@@ -1166,6 +1191,7 @@ class MainWindow(QMainWindow):
             ("credential_days_changed", "credential_days"),
             ("retention_changed", "retention_bytes"),
             ("os_notifications_changed", "os_notifications"),
+            ("close_to_tray_changed", "close_to_tray"),
             ("autosave_documents_changed", "autosave_documents"),
             ("retain_history_changed", "retain_history"),
         )
@@ -1247,6 +1273,8 @@ class MainWindow(QMainWindow):
         apply_translations(self)
         self.voice_panel.retranslate()
         self.transport.retranslate()
+        if self.tray is not None:
+            self.tray.retranslate()
         source, fmt = self._status_source
         self._set_status(source, **fmt)
         self._render_counter()
@@ -1301,6 +1329,8 @@ class MainWindow(QMainWindow):
         self.transport.stop.setEnabled(playable or self.external.active)
         self.save_button.setEnabled(playable)
         self.open_button.setEnabled(not busy)
+        if self.tray is not None:
+            self.tray.set_stop_enabled(playable or self.external.active)
 
     def _set_status(self, source: str, **fmt: object) -> None:
         """Show a status line from its English source, not its rendering.
@@ -1399,18 +1429,66 @@ class MainWindow(QMainWindow):
     # Exit (F-77, F-52)
     # ------------------------------------------------------------------
 
-    def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt override
-        if self.app.engine.busy:
-            answer = QMessageBox.question(
-                self,
-                tr("A job is still running."),
-                tr("The text you have now has not been saved."),
-                QMessageBox.StandardButton.Close | QMessageBox.StandardButton.Cancel,
+    def show_from_tray(self) -> None:
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _hide_to_tray(self) -> None:
+        """The close button ends the *window*, not the job it was running.
+
+        Nothing is asked first, whatever is running: jobs continuing while
+        hidden is the whole point, and the F-89 service and the engine never
+        looked at window visibility anyway.  The first hide of a session
+        explains itself, because the taskbar button vanishing is easy to
+        mistake for a quit.  Child dialogs are left alone -- they are
+        independent tasks that close on their own.
+        """
+        self.hide()
+        if self.tray is not None and not self._tray_hinted:
+            self._tray_hinted = True
+            self.tray.notify(
+                tr("EchoAct is still running"),
+                tr("Close sent EchoAct to the system tray. Double-click the icon to bring it back."),
             )
-            if answer is not QMessageBox.StandardButton.Close:
-                event.ignore()
+
+    def _quit_from_tray(self) -> None:
+        # A modal owned by a hidden window can surface behind other apps on
+        # Windows and read as a hang, so the window is back before it asks.
+        if self.app.engine.busy:
+            self.show()
+            self.raise_()
+            if not self._confirm_quit_with_job():
                 return
+        self._quit()
+
+    def _confirm_quit_with_job(self) -> bool:
+        answer = QMessageBox.question(
+            self,
+            tr("A job is still running."),
+            tr("The text you have now has not been saved."),
+            QMessageBox.StandardButton.Close | QMessageBox.StandardButton.Cancel,
+        )
+        return answer is QMessageBox.StandardButton.Close
+
+    def _quit(self) -> None:
+        """The one teardown: every accepted exit comes through here."""
         self._tick.stop()
         self.bridge.detach()
         self.app.shutdown()
+        if self.tray is not None:
+            self.tray.hide()
+        # With quitOnLastWindowClosed off, nothing else ends the event loop;
+        # any future code that accepts a close must route through here.
+        QApplication.instance().quit()
+
+    def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt override
+        if self.app.settings.close_to_tray and self.tray is not None:
+            event.ignore()
+            self._hide_to_tray()
+            return
+        if self.app.engine.busy and not self._confirm_quit_with_job():
+            event.ignore()
+            return
+        self._quit()
         event.accept()
